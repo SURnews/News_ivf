@@ -3,8 +3,7 @@ import telebot
 import sqlite3
 import os
 from apscheduler.schedulers.background import BackgroundScheduler
-from flask import Flask
-from threading import Thread
+from flask import Flask, request
 import logging
 
 # Настройка логирования
@@ -14,18 +13,17 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Токен и канал подтягиваются из переменных окружения
+# Токен и канал из переменных окружения
 TOKEN = os.getenv('TELEGRAM_TOKEN')
 CHANNEL = os.getenv('TELEGRAM_CHANNEL')
 
-if not TOKEN:
-    raise ValueError("Не задан TOKEN в переменных окружения")
-if not CHANNEL:
-    raise ValueError("Не задан CHANNEL в переменных окружения")
+if not TOKEN or not CHANNEL:
+    logger.error("Не заданы переменные окружения TELEGRAM_TOKEN или TELEGRAM_CHANNEL")
+    exit(1)
 
-bot = telebot.TeleBot(TOKEN) 
+bot = telebot.TeleBot(TOKEN)
 
-# База для уже отправленных новостей
+# База для отправленных новостей
 conn = sqlite3.connect('news.db', check_same_thread=False)
 cursor = conn.cursor()
 cursor.execute('CREATE TABLE IF NOT EXISTS sent_news (link TEXT PRIMARY KEY)')
@@ -79,34 +77,33 @@ def check_feeds():
                 if not link:
                     continue
                 
-                if any(kw.lower() in content for kw in KEYWORDS):
-                    if is_new(link):
-                        send_news(entry.title, link)
-                        save_news(link)
+                if any(kw.lower() in content for kw in KEYWORDS) and is_new(link):
+                    send_news(entry.title, link)
+                    save_news(link)
         except Exception as e:
             logger.error(f"Ошибка при обработке RSS {url}: {e}")
 
-# Планировщик запускает парсинг раз в час
+# Планировщик
 scheduler = BackgroundScheduler()
 scheduler.add_job(check_feeds, 'interval', hours=1)
 scheduler.start()
 
-# Flask-сервер для Render
+# Flask приложение
 app = Flask(__name__)
 
 @app.route('/')
 def home():
     return "Bot is alive!"
 
-def run_flask():
-    app.run(host='0.0.0.0', port=8080)
+@app.route('/webhook', methods=['POST'])
+def webhook():
+    """Endpoint для обработки вебхуков (если понадобится в будущем)"""
+    return "OK", 200
 
 if __name__ == '__main__':
-    # Запускаем Flask в отдельном потоке
-    flask_thread = Thread(target=run_flask)
-    flask_thread.daemon = True  # Демонизируем поток
-    flask_thread.start()
+    # Первая проверка при запуске
+    check_feeds()
     
-    logger.info("Бот запущен")
-    # Запуск бота в режиме polling
-    bot.infinity_polling()
+    # Запускаем Flask
+    port = int(os.environ.get('PORT', 8080))
+    app.run(host='0.0.0.0', port=port)
