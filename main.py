@@ -5,13 +5,25 @@ import os
 from apscheduler.schedulers.background import BackgroundScheduler
 from flask import Flask
 from threading import Thread
+import logging
+
+# Настройка логирования
+logging.basicConfig(
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    level=logging.INFO
+)
+logger = logging.getLogger(__name__)
 
 # Токен и канал подтягиваются из переменных окружения
 TOKEN = os.getenv('TELEGRAM_TOKEN')
 CHANNEL = os.getenv('TELEGRAM_CHANNEL')
 
-bot = telebot.TeleBot(TOKEN) 
+if not TOKEN:
+    raise ValueError("Не задан TOKEN в переменных окружения")
+if not CHANNEL:
+    raise ValueError("Не задан CHANNEL в переменных окружения")
 
+bot = telebot.TeleBot(TOKEN) 
 
 # База для уже отправленных новостей
 conn = sqlite3.connect('news.db', check_same_thread=False)
@@ -22,16 +34,20 @@ conn.commit()
 def send_news(title, link):
     try:
         bot.send_message(CHANNEL, f'📰 {title}\n{link}')
+        logger.info(f"Отправлена новость: {title}")
     except Exception as e:
-        print('Ошибка отправки:', e)
+        logger.error(f'Ошибка отправки: {e}')
 
 def is_new(link):
     cursor.execute('SELECT 1 FROM sent_news WHERE link = ?', (link,))
     return cursor.fetchone() is None
 
 def save_news(link):
-    cursor.execute('INSERT INTO sent_news (link) VALUES (?)', (link,))
-    conn.commit()
+    try:
+        cursor.execute('INSERT OR IGNORE INTO sent_news (link) VALUES (?)', (link,))
+        conn.commit()
+    except Exception as e:
+        logger.error(f"Ошибка при сохранении в базу: {e}")
 
 # RSS-ленты и ключевые слова
 RSS_FEEDS = [
@@ -52,26 +68,31 @@ KEYWORDS = [
 ]
 
 def check_feeds():
-    print('Проверка новостей...')
+    logger.info('Проверка новостей...')
     for url in RSS_FEEDS:
-        feed = feedparser.parse(url)
-        for entry in feed.entries:
-            if any(kw.lower() in entry.title.lower() for kw in KEYWORDS):
-                if is_new(entry.link):
-                    send_news(entry.title, entry.link)
-                    save_news(entry.link)
+        try:
+            feed = feedparser.parse(url)
+            for entry in feed.entries:
+                content = f"{entry.title} {getattr(entry, 'summary', '')}".lower()
+                link = entry.get('link', '')
+                
+                if not link:
+                    continue
+                
+                if any(kw.lower() in content for kw in KEYWORDS):
+                    if is_new(link):
+                        send_news(entry.title, link)
+                        save_news(link)
+        except Exception as e:
+            logger.error(f"Ошибка при обработке RSS {url}: {e}")
 
 # Планировщик запускает парсинг раз в час
 scheduler = BackgroundScheduler()
 scheduler.add_job(check_feeds, 'interval', hours=1)
 scheduler.start()
 
-@bot.message_handler(func=lambda message: True)
-def catch_all(message):
-    print(f"Поймано сообщение! Chat ID: {message.chat.id}")
-
-# Flask-сервер для Render + UptimeRobot
-app = Flask('')
+# Flask-сервер для Render
+app = Flask(__name__)
 
 @app.route('/')
 def home():
@@ -80,10 +101,12 @@ def home():
 def run_flask():
     app.run(host='0.0.0.0', port=8080)
 
-# Запускаем Flask в отдельном потоке
-flask_thread = Thread(target=run_flask)
-flask_thread.start()
-
-print('Бот запущен и слушает...')
-
-# Бот сам ничего не делает в цикле — только Flask держит Render активным
+if __name__ == '__main__':
+    # Запускаем Flask в отдельном потоке
+    flask_thread = Thread(target=run_flask)
+    flask_thread.daemon = True  # Демонизируем поток
+    flask_thread.start()
+    
+    logger.info("Бот запущен")
+    # Запуск бота в режиме polling
+    bot.infinity_polling()
