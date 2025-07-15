@@ -129,7 +129,7 @@ def contains_topic(content):
         r'\bdonazione di sperma\b', r'\bprocreazione medicalmente assistita\b',
         
         # Китайский (транслитерация)
-        r'\bdàiyùn\b', r'\bshìguǎn yīng'ér\b', r'\bluǎnzǐ juānzèng\b',
+        r'\bdàiyùn\b', r'\bshìguǎn yīngér\b', r'\bluǎnzǐ juānzèng\b',  # Убраны апострофы
         r'\bjīngzǐ juānzèng\b', r'\b试管婴儿\b', r'\b代孕\b', r'\b卵子捐赠\b', r'\b精子捐赠\b'
     ]
     
