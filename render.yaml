@@ -1,2 +1,17 @@
 build:
   pythonVersion: 3.12.0
+
+services:
+  - type: web
+    name: news-bot
+    env: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: ./start.sh
+    envVars:
+      - key: TELEGRAM_TOKEN
+        sync: false
+      - key: TELEGRAM_CHANNEL
+        sync: false
+      - key: DEEPL_API_KEY
+        sync: false
