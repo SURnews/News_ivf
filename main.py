@@ -10,7 +10,8 @@ from threading import Thread
 TOKEN = os.getenv('TELEGRAM_TOKEN')
 CHANNEL = os.getenv('TELEGRAM_CHANNEL')
 
-bot = telebot.TeleBot(TOKEN)
+bot = telebot.TeleBot(TOKEN) 
+
 
 # База для уже отправленных новостей
 conn = sqlite3.connect('news.db', check_same_thread=False)
@@ -64,6 +65,10 @@ def check_feeds():
 scheduler = BackgroundScheduler()
 scheduler.add_job(check_feeds, 'interval', hours=1)
 scheduler.start()
+
+@bot.message_handler(func=lambda message: True)
+def catch_all(message):
+    print(f"Поймано сообщение! Chat ID: {message.chat.id}")
 
 # Flask-сервер для Render + UptimeRobot
 app = Flask('')
