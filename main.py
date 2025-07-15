@@ -156,6 +156,9 @@ RSS_FEEDS = [
     'https://reprobank.ru/about/media/rss/',
     'https://www.ivf.ru/feed/',
     'https://altravita-ivf.ru/blog/rss/',
+    'https://lenta.ru/rss/news',
+    'https://www.rbc.ru/static/rss/news.rss',
+    'https://tass.ru/rss/v2.xml',
     
     # Англоязычные
     'https://www.fertilitynetworkuk.org/feed/',
@@ -166,7 +169,19 @@ RSS_FEEDS = [
     'https://www.technologyreview.com/feed/',
     'https://people.com/feed/',
     'https://www.scmp.com/rss/91/feed',  # South China Morning Post
-    'https://www.chinadaily.com.cn/rss/cndy_rss.xml',
+    'https://www.chinadaily.com.cn/rss/cndy_rss.xml',   
+    'https://feeds.bbci.co.uk/news/world/rss.xml',
+    'https://www.reutersagency.com/feed/?best-topics=world',
+    'http://rss.cnn.com/rss/edition.rss',
+    'https://www.theguardian.com/world/rss',
+    'https://rss.dw.com/rdf/rss-en-all',
+    'https://www.aljazeera.com/xml/rss/all.xml',
+    'https://www.medscape.com/rss/public/obgyn',
+    'https://www.news-medical.net/tag/feed/Reproductive-Health.aspx',
+    'https://www.sciencedaily.com/rss/health_medicine/fertility.xml',
+    'https://www.nih.gov/news-events/news-releases/rss.xml',
+    'https://www.eurekalert.org/rss/medicine.xml',
+    'https://www.who.int/rss-feeds/news-articles/en/',
     
     # Испанские
     'https://www.infosalus.com/rss/actualidad.xml',
