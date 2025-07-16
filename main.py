@@ -221,7 +221,7 @@ RSS_FEEDS = [
     'https://www.reutersagency.com/feed/?best-topics=world',
     'http://rss.cnn.com/rss/edition.rss',
     'https://www.theguardian.com/world/rss',
-    'https://rssexport.rbc.ru/rbcnews/news/30/full.rssМ,
+    'https://rssexport.rbc.ru/rbcnews/news/30/full.rssМ',
     'https://rss.dw.com/rdf/rss-en-all',
     
     # Англоязычные
