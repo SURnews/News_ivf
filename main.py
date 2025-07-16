@@ -347,9 +347,16 @@ def send_news(title, link):
     except Exception as e:
         logger.error(f'Ошибка отправки: {e}')
 
-# Планировщик
 scheduler = BackgroundScheduler()
-scheduler.add_job(check_feeds, 'interval', hours=1)
+
+# Настройка задачи с интервалом 5 минут и только одним экземпляром
+scheduler.add_job(
+    check_feeds,
+    'interval',
+    minutes=5,
+    max_instances=1,
+    next_run_time=datetime.now()  # Начать первую проверку сразу
+)
 scheduler.start()
 
 # Flask приложение
@@ -357,7 +364,7 @@ app = Flask(__name__)
 
 @app.route('/')
 def home():
-    return "Бот активен! Следующая проверка новостей через 1 час"
+    return "Бот активен!"
 
 @app.route('/check-now')
 def manual_check():
