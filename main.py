@@ -73,18 +73,40 @@ def get_title_hash(title):
     clean_title = title.strip().lower()
     return hashlib.sha256(clean_title.encode('utf-8')).hexdigest()
 
-# Создаем таблицу с новой структурой (ИСПРАВЛЕННАЯ ВЕРСИЯ)
-cursor.execute('''
-    CREATE TABLE IF NOT EXISTS sent_news (
-        normalized_link TEXT,
-        original_link TEXT,
-        title TEXT,
-        title_hash TEXT,
-        pubdate TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-        PRIMARY KEY (normalized_link, title_hash)
-''')
-cursor.execute('CREATE INDEX IF NOT EXISTS idx_title_hash ON sent_news(title_hash)')
-conn.commit()
+# ИСПРАВЛЕННОЕ создание таблицы
+try:
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS sent_news (
+            normalized_link TEXT,
+            original_link TEXT,
+            title TEXT,
+            title_hash TEXT,
+            pubdate TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY (normalized_link, title_hash)
+        )
+    ''')
+    cursor.execute('CREATE INDEX IF NOT EXISTS idx_title_hash ON sent_news(title_hash)')
+    conn.commit()
+    logger.info("Таблица sent_news успешно создана или уже существует")
+except sqlite3.OperationalError as e:
+    logger.error(f"Ошибка при создании таблицы: {e}")
+    # Попытка создать таблицу простым способом
+    try:
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS sent_news (
+                normalized_link TEXT,
+                original_link TEXT,
+                title TEXT,
+                title_hash TEXT,
+                pubdate TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (normalized_link, title_hash)
+            )
+        ''')
+        conn.commit()
+        logger.info("Таблица создана после повторной попытки")
+    except Exception as e:
+        logger.error(f"Критическая ошибка при создании таблицы: {e}")
+        exit(1)
 
 def normalize_url(url):
     """Улучшенная нормализация URL с удалением трекинговых параметров"""
@@ -207,7 +229,7 @@ def contains_topic(content):
     
     return False
 
-# Расширенный список RSS-лент
+# Исправленный список RSS-лент
 RSS_FEEDS = [
     # Русскоязычные
     'https://www.ivfmedia.ru/rss',
@@ -216,12 +238,12 @@ RSS_FEEDS = [
     'https://altravita-ivf.ru/blog/rss/',
     'https://lenta.ru/rss/news',
     'https://www.rbc.ru/static/rss/news.rss',
+    'https://rssexport.rbc.ru/rbcnews/news/30/full.rss',
     'https://tass.ru/rss/v2.xml',
     'https://feeds.bbci.co.uk/news/world/rss.xml',
     'https://www.reutersagency.com/feed/?best-topics=world',
     'http://rss.cnn.com/rss/edition.rss',
     'https://www.theguardian.com/world/rss',
-    'https://rssexport.rbc.ru/rbcnews/news/30/full.rssМ',
     'https://rss.dw.com/rdf/rss-en-all',
     
     # Англоязычные
@@ -232,7 +254,7 @@ RSS_FEEDS = [
     'https://www.news-medical.net/tag/feed/ivf.aspx',
     'https://www.technologyreview.com/feed/',
     'https://people.com/feed/',
-    'https://www.scmp.com/rss/91/feed',  # South China Morning Post
+    'https://www.scmp.com/rss/91/feed',
     'https://www.chinadaily.com.cn/rss/cndy_rss.xml',
     'https://www.aljazeera.com/xml/rss/all.xml',
     'https://www.medscape.com/rss/public/obgyn',
@@ -379,6 +401,10 @@ def manual_check():
     except Exception as e:
         return f"Ошибка: {str(e)}", 500
 
+@app.route('/health')
+def health_check():
+    return "OK", 200
+
 if __name__ == '__main__':
     # Проверяем наличие обязательных переменных
     if not TOKEN or not CHANNEL:
@@ -387,10 +413,13 @@ if __name__ == '__main__':
     
     # Первая проверка при запуске
     try:
+        logger.info("Запуск первой проверки новостей...")
         check_feeds()
+        logger.info("Первая проверка завершена")
     except Exception as e:
         logger.error(f"Ошибка при первом запуске: {e}")
     
     # Запускаем Flask
     port = int(os.environ.get('PORT', 8080))
+    logger.info(f"Запуск Flask приложения на порту {port}")
     app.run(host='0.0.0.0', port=port)
