@@ -4,10 +4,11 @@ import sqlite3
 import os
 import re
 import time
+import hashlib
 from apscheduler.schedulers.background import BackgroundScheduler
 from flask import Flask, request
 import logging
-from urllib.parse import urlparse
+from urllib.parse import urlparse, parse_qs, urlunparse
 from googletrans import Translator
 import deepl
 
@@ -32,6 +33,16 @@ if DEEPL_API_KEY:
     except Exception as e:
         logger.error(f"Ошибка инициализации DeepL: {e}")
 
+# Глобальный список трекинговых параметров для удаления
+TRACKING_PARAMS = {
+    'utm_source', 'utm_medium', 'utm_campaign', 'utm_term', 'utm_content',
+    'ref', 'referral', 'source', 'fbclid', 'gclid', 'yclid', '_openstat',
+    'campaign', 'mc_cid', 'mc_eid', 'session_id', 'icid', 'trk', 'trk_contact',
+    'utm_referrer', 'utm_reader', 'utm_place', 'fb_action_ids', 'fb_action_types',
+    'fb_ref', 'ga_source', 'ga_medium', 'ga_term', 'ga_content', 'ga_campaign',
+    'pk_source', 'pk_medium', 'pk_campaign'
+}
+
 def translate_text(text, src='auto', dest='ru'):
     """Переводит текст на русский язык с использованием доступных сервисов"""
     if not text.strip():
@@ -55,43 +66,88 @@ bot = telebot.TeleBot(TOKEN)
 # База для отправленных новостей
 conn = sqlite3.connect('news.db', check_same_thread=False)
 cursor = conn.cursor()
+
+# Функция для вычисления хеша заголовка
+def get_title_hash(title):
+    """Вычисляет SHA-256 хеш для заголовка"""
+    clean_title = title.strip().lower()
+    return hashlib.sha256(clean_title.encode('utf-8')).hexdigest()
+
+# Создаем таблицу с новой структурой
 cursor.execute('''
     CREATE TABLE IF NOT EXISTS sent_news (
-        normalized_link TEXT PRIMARY KEY,
+        normalized_link TEXT,
         original_link TEXT,
         title TEXT,
-        pubdate TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-    )
+        title_hash TEXT,
+        pubdate TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        PRIMARY KEY (normalized_link, title_hash)
 ''')
-cursor.execute('CREATE INDEX IF NOT EXISTS idx_normalized_link ON sent_news(normalized_link)')
+cursor.execute('CREATE INDEX IF NOT EXISTS idx_title_hash ON sent_news(title_hash)')
 conn.commit()
 
 def normalize_url(url):
-    """Удаляет UTM-метки и другие ненужные параметры из URL"""
+    """Улучшенная нормализация URL с удалением трекинговых параметров"""
     try:
         parsed = urlparse(url)
-        # Оставляем только схему, домен и путь
-        clean_url = f"{parsed.scheme}://{parsed.netloc}{parsed.path}"
-        # Удаляем якоря
-        return clean_url.split('#')[0]
+        
+        # Приводим домен к нижнему регистру и удаляем www
+        netloc = parsed.netloc.lower()
+        if netloc.startswith('www.'):
+            netloc = netloc[4:]
+        
+        # Удаляем якорь
+        parsed = parsed._replace(fragment="", netloc=netloc)
+        
+        # Фильтрация параметров запроса
+        if parsed.query:
+            query_params = parse_qs(parsed.query, keep_blank_values=True)
+            filtered_params = {}
+            
+            for key, values in query_params.items():
+                # Приводим ключ к нижнему регистру для проверки
+                key_lower = key.lower()
+                
+                # Сохраняем только нетрекинговые параметры
+                if key_lower not in TRACKING_PARAMS:
+                    filtered_params[key] = values
+            
+            # Сортируем параметры для единообразия
+            sorted_params = sorted(filtered_params.items(), key=lambda x: x[0])
+            new_query = urlencode(sorted_params, doseq=True)
+            parsed = parsed._replace(query=new_query)
+        
+        # Убираем дублирующиеся слэши в пути
+        path = re.sub(r'/{2,}', '/', parsed.path)
+        parsed = parsed._replace(path=path)
+        
+        return urlunparse(parsed)
     except Exception as e:
         logger.error(f"Ошибка нормализации URL {url}: {e}")
         return url
 
-def is_new(link):
-    """Проверяет новость по нормализованному URL"""
+def is_new(link, title):
+    """Проверяет новость по нормализованному URL и хешу заголовка"""
     normalized = normalize_url(link)
-    cursor.execute('SELECT 1 FROM sent_news WHERE normalized_link = ?', (normalized,))
+    title_hash = get_title_hash(title)
+    
+    cursor.execute('''
+        SELECT 1 FROM sent_news 
+        WHERE normalized_link = ? OR title_hash = ?
+    ''', (normalized, title_hash))
     return cursor.fetchone() is None
 
 def save_news(link, title):
-    """Сохраняет новость с нормализованным URL"""
+    """Сохраняет новость с нормализованным URL и хешем заголовка"""
     try:
         normalized = normalize_url(link)
+        title_hash = get_title_hash(title)
+        
         cursor.execute('''
-            INSERT OR IGNORE INTO sent_news (normalized_link, original_link, title)
-            VALUES (?, ?, ?)
-        ''', (normalized, link, title))
+            INSERT OR IGNORE INTO sent_news 
+            (normalized_link, original_link, title, title_hash)
+            VALUES (?, ?, ?, ?)
+        ''', (normalized, link, title, title_hash))
         conn.commit()
         logger.info(f"Сохранена новость: {title}")
     except Exception as e:
@@ -129,7 +185,7 @@ def contains_topic(content):
         r'\bdonazione di sperma\b', r'\bprocreazione medicalmente assistita\b',
         
         # Китайский (транслитерация)
-        r'\bdàiyùn\b', r'\bshìguǎn yīngér\b', r'\bluǎnzǐ juānzèng\b',  # Убраны апострофы
+        r'\bdàiyùn\b', r'\bshìguǎn yīngér\b', r'\bluǎnzǐ juānzèng\b',
         r'\bjīngzǐ juānzèng\b', r'\b试管婴儿\b', r'\b代孕\b', r'\b卵子捐赠\b', r'\b精子捐赠\b'
     ]
     
@@ -232,7 +288,7 @@ def check_feeds():
                     continue
                 
                 # Проверка уникальности
-                if is_new(link):
+                if is_new(link, title):
                     # Задержка для избежания блокировки
                     time.sleep(1)
                     
@@ -241,10 +297,15 @@ def check_feeds():
                     new_count += 1
                 else:
                     duplicate_count += 1
-                    logger.info(f"Дубликат новости: {title}")
+                    logger.info(f"Дубликат новости: {title} | URL: {normalize_url(link)}")
         
         except Exception as e:
             logger.error(f"Ошибка при обработке RSS {url}: {e}")
+            time.sleep(5)  # Задержка при ошибках
+    
+    # Очистка старых записей
+    cursor.execute("DELETE FROM sent_news WHERE pubdate < date('now', '-30 days')")
+    conn.commit()
     
     logger.info(f"Проверка завершена. Новые: {new_count}, дубликаты: {duplicate_count}, не по теме: {irrelevant_count}")
 
@@ -265,8 +326,8 @@ def send_news(title, link):
         except Exception as e:
             logger.error(f"Ошибка определения языка: {e}")
         
-        # Форматирование сообщения с хэштегами
-        message = f"🔬 *{title}*\n\n{link}\n\n"
+        # Форматирование сообщения с гиперссылкой вместо полного URL
+        message = f"🔬 *{title}*\n\n[Источник]({link})\n\n"
         
         # Добавляем хэштеги в зависимости от языка
         hashtags = "#ВРТ #ЭКО #СуррогатноеМатеринство"
@@ -275,7 +336,13 @@ def send_news(title, link):
         
         message += hashtags
         
-        bot.send_message(CHANNEL, message, parse_mode='Markdown')
+        # Отправляем сообщение с поддержкой Markdown
+        bot.send_message(
+            CHANNEL, 
+            message, 
+            parse_mode='Markdown',
+            disable_web_page_preview=True
+        )
         logger.info(f"Отправлена новость: {original_title}")
     except Exception as e:
         logger.error(f'Ошибка отправки: {e}')
@@ -304,6 +371,10 @@ def manual_check():
 if __name__ == '__main__':
     # Первая проверка при запуске
     check_feeds()
+    
+    # Запускаем Flask
+    port = int(os.environ.get('PORT', 8080))
+    app.run(host='0.0.0.0', port=port)
     
     # Запускаем Flask
     port = int(os.environ.get('PORT', 8080))
