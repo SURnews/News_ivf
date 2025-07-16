@@ -73,7 +73,7 @@ def get_title_hash(title):
     clean_title = title.strip().lower()
     return hashlib.sha256(clean_title.encode('utf-8')).hexdigest()
 
-# Создаем таблицу с новой структурой
+# Создаем таблицу с новой структурой (ИСПРАВЛЕННАЯ ВЕРСИЯ)
 cursor.execute('''
     CREATE TABLE IF NOT EXISTS sent_news (
         normalized_link TEXT,
@@ -150,6 +150,8 @@ def save_news(link, title):
         ''', (normalized, link, title, title_hash))
         conn.commit()
         logger.info(f"Сохранена новость: {title}")
+    except sqlite3.IntegrityError:
+        logger.warning(f"Попытка вставить дубликат: {title}")
     except Exception as e:
         logger.error(f"Ошибка при сохранении в базу: {e}")
 
@@ -219,6 +221,7 @@ RSS_FEEDS = [
     'https://www.reutersagency.com/feed/?best-topics=world',
     'http://rss.cnn.com/rss/edition.rss',
     'https://www.theguardian.com/world/rss',
+    'https://rssexport.rbc.ru/rbcnews/news/30/full.rssМ,
     'https://rss.dw.com/rdf/rss-en-all',
     
     # Англоязычные
@@ -268,6 +271,10 @@ def check_feeds():
     for url in RSS_FEEDS:
         try:
             feed = feedparser.parse(url)
+            if not feed.entries:
+                logger.warning(f"Нет новостей в фиде: {url}")
+                continue
+                
             logger.info(f"Обработка фида: {url} ({len(feed.entries)} новостей)")
             
             for entry in feed.entries:
@@ -304,8 +311,12 @@ def check_feeds():
             time.sleep(5)  # Задержка при ошибках
     
     # Очистка старых записей
-    cursor.execute("DELETE FROM sent_news WHERE pubdate < date('now', '-30 days')")
-    conn.commit()
+    try:
+        cursor.execute("DELETE FROM sent_news WHERE pubdate < date('now', '-30 days')")
+        conn.commit()
+        logger.info(f"Очищено старых записей: {cursor.rowcount}")
+    except Exception as e:
+        logger.error(f"Ошибка очистки БД: {e}")
     
     logger.info(f"Проверка завершена. Новые: {new_count}, дубликаты: {duplicate_count}, не по теме: {irrelevant_count}")
 
@@ -369,12 +380,16 @@ def manual_check():
         return f"Ошибка: {str(e)}", 500
 
 if __name__ == '__main__':
-    # Первая проверка при запуске
-    check_feeds()
+    # Проверяем наличие обязательных переменных
+    if not TOKEN or not CHANNEL:
+        logger.error("Не заданы обязательные переменные окружения: TELEGRAM_TOKEN или TELEGRAM_CHANNEL")
+        exit(1)
     
-    # Запускаем Flask
-    port = int(os.environ.get('PORT', 8080))
-    app.run(host='0.0.0.0', port=port)
+    # Первая проверка при запуске
+    try:
+        check_feeds()
+    except Exception as e:
+        logger.error(f"Ошибка при первом запуске: {e}")
     
     # Запускаем Flask
     port = int(os.environ.get('PORT', 8080))
