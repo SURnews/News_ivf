@@ -5,14 +5,12 @@ import os
 import re
 import time
 import hashlib
-import urllib.parse
 from apscheduler.schedulers.background import BackgroundScheduler
 from flask import Flask, request
 import logging
-from urllib.parse import urlparse, parse_qs, urlunparse, urlencode
+from urllib.parse import urlparse, parse_qs, urlunparse
 from googletrans import Translator
 import deepl
-import html
 
 # Настройка логирования
 logging.basicConfig(
@@ -76,21 +74,17 @@ def get_title_hash(title):
     return hashlib.sha256(clean_title.encode('utf-8')).hexdigest()
 
 # Создаем таблицу с новой структурой
-try:
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS sent_news (
-            normalized_link TEXT,
-            original_link TEXT,
-            title TEXT,
-            title_hash TEXT,
-            pubdate TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            PRIMARY KEY (normalized_link, title_hash)
-        ''')
-    cursor.execute('CREATE INDEX IF NOT EXISTS idx_title_hash ON sent_news(title_hash)')
-    conn.commit()
-    logger.info("Таблица sent_news успешно создана или уже существует")
-except Exception as e:
-    logger.error(f"Ошибка при создании таблицы: {e}")
+cursor.execute('''
+    CREATE TABLE IF NOT EXISTS sent_news (
+        normalized_link TEXT,
+        original_link TEXT,
+        title TEXT,
+        title_hash TEXT,
+        pubdate TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        PRIMARY KEY (normalized_link, title_hash)
+''')
+cursor.execute('CREATE INDEX IF NOT EXISTS idx_title_hash ON sent_news(title_hash)')
+conn.commit()
 
 def normalize_url(url):
     """Улучшенная нормализация URL с удалением трекинговых параметров"""
@@ -139,7 +133,7 @@ def is_new(link, title):
     
     cursor.execute('''
         SELECT 1 FROM sent_news 
-        WHERE normalized_link = ? AND title_hash = ?
+        WHERE normalized_link = ? OR title_hash = ?
     ''', (normalized, title_hash))
     return cursor.fetchone() is None
 
@@ -156,81 +150,62 @@ def save_news(link, title):
         ''', (normalized, link, title, title_hash))
         conn.commit()
         logger.info(f"Сохранена новость: {title}")
-    except sqlite3.IntegrityError:
-        logger.warning(f"Попытка вставить дубликат: {title}")
     except Exception as e:
         logger.error(f"Ошибка при сохранении в базу: {e}")
 
-def clean_html(raw_html):
-    """Удаляет HTML-теги из текста"""
-    cleanr = re.compile('<.*?>')
-    cleantext = re.sub(cleanr, '', raw_html)
-    return html.unescape(cleantext)
-
 def contains_topic(content):
     """Проверяет, относится ли новость к нужной тематике с использованием регулярных выражений"""
-    # Очищаем контент от HTML-тегов
-    clean_content = clean_html(content).lower()
-    
     # Основные ключевые слова на разных языках
     patterns = [
         # Русский
         r'\bсуррогатн\w*\b', r'\bэко\b', r'\bвспомогательные репродуктивные\b', 
         r'\bвпр\b', r'\bдонорство ооцитов\b', r'\bдонорство спермы\b',
         r'\bсурмама\b', r'\bсуррогатной матери\b', r'\bрепродуктивн\w*\b',
-        r'\bбесплодие\b', r'\bоплодотворение in vitro\b',
         
         # Английский
         r'\bsurrogacy\b', r'\bivf\b', r'\bassisted reproductive technology\b', 
         r'\bart\b', r'\begg donation\b', r'\bsperm donation\b',
         r'\bfertility treatment\b', r'\bin vitro fertilization\b',
-        r'\bembryo transfer\b', r'\bsurrogate mother\b', r'\bfertility clinic\b',
-        r'\breproductive medicine\b', r'\bgestational carrier\b',
+        r'\bembryo transfer\b', r'\bsurrogate mother\b',
         
         # Испанский
         r'\bmaternidad subrogada\b', r'\bfiv\b', r'\bdonación de óvulos\b', 
         r'\bdonación de esperma\b', r'\bgestación subrogada\b',
-        r'\bfertilidad\b', r'\breproducción asistida\b',
         
         # Французский
         r'\bmère porteuse\b', r'\bpma\b', r'\bdon d’ovocytes\b', 
         r'\bdon de sperme\b', r'\bprocréation médicalement assistée\b',
-        r'\bgestation pour autrui\b', r'\bfertilité\b',
         
         # Немецкий
         r'\bleihmutterschaft\b', r'\bkünstliche befruchtung\b', r'\beizellspende\b',
-        r'\bsamenspende\b', r'\breproduktionsmedizin\b', r'\bfruchtbarkeit\b',
-        r'\bin-vitro-fertilisation\b',
+        r'\bsamenspende\b', r'\breproduktionsmedizin\b',
         
         # Итальянский
         r'\bmaternità surrogata\b', r'\bgravidanza surrogata\b', r'\bdonazione di ovociti\b',
         r'\bdonazione di sperma\b', r'\bprocreazione medicalmente assistita\b',
-        r'\bfertilita\b', r'\bfivet\b',
         
-        # Китайский
-        r'\b代孕\b', r'\b试管婴儿\b', r'\b卵子捐赠\b', r'\b精子捐赠\b',  # Иероглифы
-        r'\bdàiyùn\b', r'\bshìguǎn yīngér\b', r'\bluǎnzǐ juānzèng\b',  # Пиньинь
-        r'\bjīngzǐ juānzèng\b', r'\b辅助生殖\b'
+        # Китайский (транслитерация)
+        r'\bdàiyùn\b', r'\bshìguǎn yīngér\b', r'\bluǎnzǐ juānzèng\b',
+        r'\bjīngzǐ juānzèng\b', r'\b试管婴儿\b', r'\b代孕\b', r'\b卵子捐赠\b', r'\b精子捐赠\b'
     ]
+    
+    content_lower = content.lower()
     
     # Проверка по всем паттернам
     for pattern in patterns:
-        if re.search(pattern, clean_content, re.IGNORECASE):
+        if re.search(pattern, content_lower, re.IGNORECASE):
             return True
     
     # Дополнительная проверка для аббревиатур
-    if re.search(r'\bart\b', clean_content, re.IGNORECASE):
+    if re.search(r'\bart\b', content_lower, re.IGNORECASE):
         # Проверка контекста для ART (чтобы исключить "искусство")
-        context_keywords = [
-            'репродуктивн', 'fertility', 'fiv', 'оплодотворен', 'reproduction',
-            'reproducción', 'reprodução', 'fortplantning', 'воспроизведение'
-        ]
-        if any(kw in clean_content for kw in context_keywords):
+        context_keywords = ['репродуктивн', 'fertility', 'fiv', 'оплодотворен', 'reproduction']
+        if any(kw in content_lower for kw in context_keywords):
             return True
     
     return False
 
-# Расширенный список международных RSS-лент
+# Расширенный список RSS-лент
 RSS_FEEDS = [
     # Русскоязычные
     'https://www.ivfmedia.ru/rss',
@@ -238,73 +213,50 @@ RSS_FEEDS = [
     'https://www.ivf.ru/feed/',
     'https://altravita-ivf.ru/blog/rss/',
     'https://lenta.ru/rss/news',
-    'https://rssexport.rbc.ru/rbcnews/news/30/full.rss',
+    'https://www.rbc.ru/static/rss/news.rss',
     'https://tass.ru/rss/v2.xml',
-    'https://www.rbc.ru/rss/main',
+    'https://feeds.bbci.co.uk/news/world/rss.xml',
+    'https://www.reutersagency.com/feed/?best-topics=world',
+    'http://rss.cnn.com/rss/edition.rss',
+    'https://www.theguardian.com/world/rss',
+    'https://rss.dw.com/rdf/rss-en-all',
     
     # Англоязычные
     'https://www.fertilitynetworkuk.org/feed/',
     'https://www.fertstert.org/rss',
+    'https://www.fertilityscience.org/feed',
     'https://www.ivf.net/rss',
     'https://www.news-medical.net/tag/feed/ivf.aspx',
     'https://www.technologyreview.com/feed/',
+    'https://people.com/feed/',
+    'https://www.scmp.com/rss/91/feed',  # South China Morning Post
+    'https://www.chinadaily.com.cn/rss/cndy_rss.xml',
+    'https://www.aljazeera.com/xml/rss/all.xml',
+    'https://www.medscape.com/rss/public/obgyn',
     'https://www.sciencedaily.com/rss/health_medicine/fertility.xml',
     'https://www.nih.gov/news-events/news-releases/rss.xml',
-    'https://www.bbc.com/news/health/rss.xml',
-    'https://www.reutersagency.com/feed/?best-topics=health',
-    'http://rss.cnn.com/rss/edition_health.rss',
-    'https://www.theguardian.com/science/health/rss',
-    'https://rss.dw.com/rdf/rss-en-health',
-    
-    # Французские
-    'https://www.lemonde.fr/sante/rss_full.xml',
-    'https://www.lefigaro.fr/rss/figaro_sante.xml',
-    'https://www.liberation.fr/arc/outboundfeeds/rss/section/sante/?outputType=xml',
-    'https://www.leparisien.fr/sante/rss.xml',
+    'https://www.eurekalert.org/rss/medicine.xml',
+    'https://www.who.int/rss-feeds/news-articles/en/',
     
     # Испанские
-    'https://www.elmundo.es/rss/salud.xml',
-    'https://www.abc.es/rss/feeds/abc_Salud.xml',
-    'https://elpais.com/sociedad/salud/rss',
-    'https://www.lavanguardia.com/vida/salud/rss.xml',
-    
-    # Немецкие
-    'https://www.spiegel.de/gesundheit/index.rss',
-    'https://www.faz.net/rss/aktuell/gesundheit/',
-    'https://www.sueddeutsche.de/gesundheit/rss',
-    'https://www.welt.de/gesundheit/?service=Rss',
+    'https://www.infosalus.com/rss/actualidad.xml',
+    'https://www.redaccionmedica.com/rss/noticias',
+    'https://www.consalud.es/rss/actualidad',
     
     # Итальянские
-    'https://www.corriere.it/salute/rss',
+    'https://www.ogginotizie.it/rss/salute.xml',
+    'https://www.quotidianosanita.it/rss.php',
     'https://www.repubblica.it/salute/rss',
-    'https://www.lastampa.it/rss/salute',
-    'https://www.ilmessaggero.it/salute/rss',
     
-    # Китайские
-    'http://www.xinhuanet.com/english/rss/healthrss.xml',
-    'https://www.chinanews.com/rss/health.shtml',
-    'https://www.globaltimes.cn/rss/health.xml',
-    'https://www.scmp.com/rss/90/feed',  # Health section
+    # Немецкие
+    'https://www.aerzteblatt.de/rss.xml',
+    'https://www.baby-und-familie.de/rss.xml',
+    'https://www.kinderaerzte-im-netz.de/rss.xml',
     
-    # Японские
-    'https://www.nikkei.com/rss/news/cate/health.html',
-    'https://www.asahi.com/rss/science_health.rdf',
-    
-    # Корейские
-    'https://www.koreabiomed.com/rss/news',
-    'https://www.koreatimes.co.kr/www/rss/health.xml',
-    
-    # Португальские (Бразилия)
-    'https://g1.globo.com/rss/g1/saude/',
-    'https://www.uol.com.br/universa/gravidez/rss.xml',
-    
-    # Арабские
-    'https://www.aljazeera.net/xml/rss/all.xml',
-    'https://arabic.rt.com/rss/news/',
-    
-    # Индийские
-    'https://www.thehindu.com/sci-tech/health/rss',
-    'https://indianexpress.com/section/health-wellness/feed/'
+    # Китайские (англоязычные)
+    'https://www.chinadaily.com.cn/rss/cndy_rss.xml',
+    'https://www.scmp.com/rss/91/feed',
+    'https://www.globaltimes.cn/rss/health.xml'
 ]
 
 def check_feeds():
@@ -316,55 +268,44 @@ def check_feeds():
     for url in RSS_FEEDS:
         try:
             feed = feedparser.parse(url)
-            if not feed.entries:
-                logger.warning(f"Нет новостей в фиде: {url}")
-                continue
-                
             logger.info(f"Обработка фида: {url} ({len(feed.entries)} новостей)")
             
             for entry in feed.entries:
-                try:
-                    link = entry.get('link', '')
-                    title = clean_html(entry.get('title', ''))
-                    summary = clean_html(entry.get('summary', entry.get('description', '')))
+                link = entry.get('link', '')
+                title = entry.get('title', '')
+                summary = entry.get('summary', '')
+                
+                if not link or not title:
+                    continue
+                
+                # Полный текст для анализа
+                full_content = f"{title} {summary}".lower()
+                
+                # Усиленная проверка тематики
+                if not contains_topic(full_content):
+                    irrelevant_count += 1
+                    logger.debug(f"Новость не по теме: {title}")
+                    continue
+                
+                # Проверка уникальности
+                if is_new(link, title):
+                    # Задержка для избежания блокировки
+                    time.sleep(1)
                     
-                    if not link or not title:
-                        continue
-                    
-                    # Полный текст для анализа
-                    full_content = f"{title} {summary}".lower()
-                    
-                    # Усиленная проверка тематики
-                    if not contains_topic(full_content):
-                        irrelevant_count += 1
-                        logger.debug(f"Новость не по теме: {title}")
-                        continue
-                    
-                    # Проверка уникальности
-                    if is_new(link, title):
-                        # Задержка для избежания блокировки
-                        time.sleep(0.5)
-                        
-                        send_news(title, link)
-                        save_news(link, title)
-                        new_count += 1
-                    else:
-                        duplicate_count += 1
-                        logger.info(f"Дубликат новости: {title} | URL: {normalize_url(link)}")
-                except Exception as e:
-                    logger.error(f"Ошибка при обработке новости: {e}")
+                    send_news(title, link)
+                    save_news(link, title)
+                    new_count += 1
+                else:
+                    duplicate_count += 1
+                    logger.info(f"Дубликат новости: {title} | URL: {normalize_url(link)}")
         
         except Exception as e:
             logger.error(f"Ошибка при обработке RSS {url}: {e}")
             time.sleep(5)  # Задержка при ошибках
     
     # Очистка старых записей
-    try:
-        cursor.execute("DELETE FROM sent_news WHERE pubdate < date('now', '-30 days')")
-        conn.commit()
-        logger.info(f"Очищено старых записей: {cursor.rowcount}")
-    except Exception as e:
-        logger.error(f"Ошибка очистки БД: {e}")
+    cursor.execute("DELETE FROM sent_news WHERE pubdate < date('now', '-30 days')")
+    conn.commit()
     
     logger.info(f"Проверка завершена. Новые: {new_count}, дубликаты: {duplicate_count}, не по теме: {irrelevant_count}")
 
@@ -427,25 +368,10 @@ def manual_check():
     except Exception as e:
         return f"Ошибка: {str(e)}", 500
 
-@app.route('/health')
-def health_check():
-    return "OK", 200
-
 if __name__ == '__main__':
-    # Проверяем наличие обязательных переменных
-    if not TOKEN or not CHANNEL:
-        logger.error("Не заданы обязательные переменные окружения: TELEGRAM_TOKEN или TELEGRAM_CHANNEL")
-        exit(1)
-    
     # Первая проверка при запуске
-    try:
-        logger.info("Запуск первой проверки новостей...")
-        check_feeds()
-        logger.info("Первая проверка завершена")
-    except Exception as e:
-        logger.error(f"Ошибка при первом запуске: {e}")
+    check_feeds()
     
     # Запускаем Flask
-    port = int(os.environ.get('PORT', 10000))
-    logger.info(f"Запуск Flask приложения на порту {port}")
+    port = int(os.environ.get('PORT', 8080))
     app.run(host='0.0.0.0', port=port)
