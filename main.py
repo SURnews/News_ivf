@@ -23,9 +23,33 @@ TOKEN = os.getenv('TELEGRAM_TOKEN')
 CHANNEL = os.getenv('TELEGRAM_CHANNEL')
 DEEPL_API_KEY = os.getenv('DEEPL_API_KEY')  # Опционально
 
+# Инициализация переводчиков
+translator = Translator()
+deepl_translator = None
+if DEEPL_API_KEY:
+    try:
+        deepl_translator = deepl.Translator(DEEPL_API_KEY)
+    except Exception as e:
+        logger.error(f"Ошибка инициализации DeepL: {e}")
 
-
+def translate_text(text, src='auto', dest='ru'):
+    """Переводит текст на русский язык с использованием доступных сервисов"""
+    if not text.strip():
+        return text
         
+    try:
+        # Пробуем DeepL если доступен
+        if deepl_translator:
+            result = deepl_translator.translate_text(text, target_lang=dest)
+            return result.text
+        
+        # Используем Google Translate как резервный вариант
+        translation = translator.translate(text, src=src, dest=dest)
+        return translation.text
+    except Exception as e:
+        logger.error(f"Ошибка перевода: {e}")
+        return text  # Возвращаем оригинальный текст в случае ошибки
+
 bot = telebot.TeleBot(TOKEN)
 
 # База для отправленных новостей
@@ -135,6 +159,11 @@ RSS_FEEDS = [
     'https://lenta.ru/rss/news',
     'https://www.rbc.ru/static/rss/news.rss',
     'https://tass.ru/rss/v2.xml',
+    'https://feeds.bbci.co.uk/news/world/rss.xml',
+    'https://www.reutersagency.com/feed/?best-topics=world',
+    'http://rss.cnn.com/rss/edition.rss',
+    'https://www.theguardian.com/world/rss',
+    'https://rss.dw.com/rdf/rss-en-all',
     
     # Англоязычные
     'https://www.fertilitynetworkuk.org/feed/',
@@ -145,15 +174,9 @@ RSS_FEEDS = [
     'https://www.technologyreview.com/feed/',
     'https://people.com/feed/',
     'https://www.scmp.com/rss/91/feed',  # South China Morning Post
-    'https://www.chinadaily.com.cn/rss/cndy_rss.xml',   
-    'https://feeds.bbci.co.uk/news/world/rss.xml',
-    'https://www.reutersagency.com/feed/?best-topics=world',
-    'http://rss.cnn.com/rss/edition.rss',
-    'https://www.theguardian.com/world/rss',
-    'https://rss.dw.com/rdf/rss-en-all',
+    'https://www.chinadaily.com.cn/rss/cndy_rss.xml',
     'https://www.aljazeera.com/xml/rss/all.xml',
     'https://www.medscape.com/rss/public/obgyn',
-    'https://www.news-medical.net/tag/feed/Reproductive-Health.aspx',
     'https://www.sciencedaily.com/rss/health_medicine/fertility.xml',
     'https://www.nih.gov/news-events/news-releases/rss.xml',
     'https://www.eurekalert.org/rss/medicine.xml',
@@ -228,11 +251,28 @@ def check_feeds():
 def send_news(title, link):
     try:
         original_title = title
+        translated = False
+        
+        # Пытаемся определить язык
+        try:
+            detected_lang = translator.detect(title).lang
+            if detected_lang != 'ru':
+                # Переводим только если язык определен и не русский
+                ru_title = translate_text(title, src=detected_lang, dest='ru')
+                if ru_title != title:
+                    title = f"{ru_title}\n({original_title})"
+                    translated = True
+        except Exception as e:
+            logger.error(f"Ошибка определения языка: {e}")
+        
         # Форматирование сообщения с хэштегами
         message = f"🔬 *{title}*\n\n{link}\n\n"
         
         # Добавляем хэштеги в зависимости от языка
         hashtags = "#ВРТ #ЭКО #СуррогатноеМатеринство"
+        if translated:
+            hashtags += " #Перевод"
+        
         message += hashtags
         
         bot.send_message(CHANNEL, message, parse_mode='Markdown')
