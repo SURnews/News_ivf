@@ -239,6 +239,7 @@ def contains_topic(content):
         r'\bсурмама\b', r'\bсуррогатной матери\b', r'\bрепродуктивн\w*\b',
         r'\bбесплодие\b', r'\bоплодотворение in vitro\b',
         
+        
         # Английский
         r'\bsurrogacy\b', r'\bivf\b', r'\bassisted reproductive technology\b', 
         r'\bart\b', r'\begg donation\b', r'\bsperm donation\b',
@@ -308,10 +309,16 @@ RSS_FEEDS = [
     'http://rss.cnn.com/rss/cnn_health.rss',
     'https://www.theguardian.com/society/health/rss',
     'https://rss.dw.com/rdf/rss_en-health',
+    'https://rss.app/feeds/tiVcHni4RDHNFtfD.csv',
+    'https://rss.app/feeds/tA3pGgONfk8afopJ.csv',
+    'https://rss.app/feeds/tpZ1sVm5QS1xWvIX.csv',
+    'https://rss.app/feeds/t8CQcj4rcyVo1blZ.csv',
+    'https://rss.app/feeds/tCCWBg8ZL1srqv8P.csv',
     
     # Французские
     'https://www.lemonde.fr/sante/rss_full.xml',
     'https://www.lefigaro.fr/rss/figaro_sante.xml',
+    'https://rss.app/feeds/t0229xqehsbyeDIz.csv',
     'https://www.liberation.fr/arc/outboundfeeds/rss/section/sante/?outputType=xml',
     
     # Испанские
