@@ -302,12 +302,12 @@ RSS_FEEDS = [
     'https://www.news-medical.net/tag/feed/ivf.aspx',
     'https://www.technologyreview.com/feed/',
     'https://www.sciencedaily.com/rss/health_medicine/fertility.xml',
-    'https://www.nih.gov/news-events/news-releases/rss.xml',
+    'https://www.nih.gov/about-nih/what-we-do/nih-almanac/rss-feed',
     'https://www.bbc.com/news/health/rss.xml',
-    'https://www.reutersagency.com/feed/?best-topics=health',
-    'http://rss.cnn.com/rss/edition_health.rss',
-    'https://www.theguardian.com/science/health/rss',
-    'https://rss.dw.com/rdf/rss-en-health',
+    'https://www.reutersagency.com/feed/?taxonomy=best-sectors&post_type=best',
+    'http://rss.cnn.com/rss/cnn_health.rss',
+    'https://www.theguardian.com/society/health/rss',
+    'https://rss.dw.com/rdf/rss_en-health',
     
     # Французские
     'https://www.lemonde.fr/sante/rss_full.xml',
@@ -316,23 +316,23 @@ RSS_FEEDS = [
     
     # Испанские
     'https://www.elmundo.es/rss/salud.xml',
-    'https://www.abc.es/rss/feeds/abc_Salud.xml',
+    'https://www.abc.es/rss/feeds/abc_ultimas.xml',
     'https://elpais.com/sociedad/salud/rss',
     
     # Немецкие
     'https://www.spiegel.de/gesundheit/index.rss',
-    'https://www.faz.net/rss/aktuell/gesundheit/',
+    'https://www.faz.net/aktuell/gesundheit/rss',
     'https://www.sueddeutsche.de/gesundheit/rss',
     
     # Итальянские
-    'https://www.corriere.it/salute/rss',
+    'https://xml2.corriereobjects.it/rss/salute.xml',
     'https://www.repubblica.it/salute/rss',
     'https://www.lastampa.it/rss/salute',
     
     # Китайские
     'http://www.xinhuanet.com/english/rss/healthrss.xml',
     'https://www.chinanews.com/rss/health.shtml',
-    'https://www.scmp.com/rss/90/feed',  # Health section
+    'hhttps://www.scmp.com/rss/4/feed',  # Health section
     
     # Японские
     'https://www.nikkei.com/rss/news/cate/health.html',
@@ -342,9 +342,6 @@ RSS_FEEDS = [
     
     # Португальские (Бразилия)
     'https://g1.globo.com/rss/g1/saude/',
-    
-    # Арабские
-    'https://www.aljazeera.net/xml/rss/all.xml',
     
     # Индийские
     'https://www.thehindu.com/sci-tech/health/rss'
