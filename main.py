@@ -314,6 +314,7 @@ RSS_FEEDS = [
     'https://rss.app/feeds/tpZ1sVm5QS1xWvIX.xml',
     'https://rss.app/feeds/t8CQcj4rcyVo1blZ.xml',
     'https://rss.app/feeds/tCCWBg8ZL1srqv8P.xml',
+    'https://rss.app/feeds/t0229xqehsbyeDIz.xml',
     
     # Французские
     'https://www.lemonde.fr/sante/rss_full.xml',
