@@ -295,12 +295,10 @@ RSS_FEEDS = [
     'https://lenta.ru/rss/news',
     'https://rssexport.rbc.ru/rbcnews/news/30/full.rss',
     'https://tass.ru/rss/v2.xml',
-    'https://www.rbc.ru/rss/main',
+    'https://rssexport.rbc.ru/rbcnews/news/30/full.rss',
     
     # Англоязычные
     'https://www.fertilitynetworkuk.org/feed/',
-    'https://www.fertstert.org/rss',
-    'https://www.ivf.net/rss',
     'https://www.news-medical.net/tag/feed/ivf.aspx',
     'https://www.technologyreview.com/feed/',
     'https://www.sciencedaily.com/rss/health_medicine/fertility.xml',
