@@ -292,10 +292,6 @@ def contains_topic(content):
 # Расширенный список международных RSS-лент
 RSS_FEEDS = [
     # Русскоязычные
-    'https://www.ivfmedia.ru/rss',
-    'https://reprobank.ru/about/media/rss/',
-    'https://www.ivf.ru/feed/',
-    'https://altravita-ivf.ru/blog/rss/',
     'https://lenta.ru/rss/news',
     'https://rssexport.rbc.ru/rbcnews/news/30/full.rss',
     'https://tass.ru/rss/v2.xml',
