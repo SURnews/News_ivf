@@ -15,6 +15,7 @@ from googletrans import Translator
 import deepl
 import html
 import sys
+from datetime import datetime
 
 # Настройка логирования
 logging.basicConfig(
@@ -356,6 +357,7 @@ RSS_FEEDS = [
 ]
 
 def check_feeds():
+    start_time = time.time()
     logger.info('Начало проверки новостей...')
     new_count = 0
     duplicate_count = 0
@@ -372,6 +374,11 @@ def check_feeds():
             
             for entry in feed.entries:
                 try:
+                    # Проверяем время выполнения
+                    if time.time() - start_time > 240:  # 4 минуты
+                        logger.warning("Прерывание проверки из-за превышения времени")
+                        break
+                        
                     link = entry.get('link', '')
                     title = clean_html(entry.get('title', ''))
                     summary = clean_html(entry.get('summary', entry.get('description', '')))
@@ -391,7 +398,7 @@ def check_feeds():
                     # Проверка уникальности
                     if is_new(link, title):
                         # Задержка для избежания блокировки
-                        time.sleep(0.5)
+                        time.sleep(0.2)
                         
                         send_news(title, link)
                         save_news(link, title)
@@ -404,7 +411,7 @@ def check_feeds():
         
         except Exception as e:
             logger.error(f"Ошибка при обработке RSS {url}: {e}")
-            time.sleep(5)  # Задержка при ошибках
+            time.sleep(2)  # Задержка при ошибках
     
     # Очистка старых записей
     try:
@@ -420,7 +427,8 @@ def check_feeds():
         if conn:
             conn.close()
     
-    logger.info(f"Проверка завершена. Новые: {new_count}, дубликаты: {duplicate_count}, не по теме: {irrelevant_count}")
+    elapsed = time.time() - start_time
+    logger.info(f"Проверка завершена за {elapsed:.2f} сек. Новые: {new_count}, дубликаты: {duplicate_count}, не по теме: {irrelevant_count}")
 
 def send_news(title, link):
     try:
@@ -460,18 +468,15 @@ def send_news(title, link):
     except Exception as e:
         logger.error(f'Ошибка отправки: {e}')
 
-# Планировщик
+# Планировщик с интервалом 5 минут
 scheduler = BackgroundScheduler()
-
-# Настройка задачи с интервалом 5 минут и только одним экземпляром
 scheduler.add_job(
     check_feeds,
     'interval',
     minutes=5,
     max_instances=1,
-    next_run_time=datetime.now()  # Начать первую проверку сразу
+    next_run_time=datetime.now()  # Запустить сразу при старте
 )
-
 scheduler.start()
 
 # Flask приложение
@@ -479,7 +484,7 @@ app = Flask(__name__)
 
 @app.route('/')
 def home():
-    return "Бот активен! Следующая проверка новостей через 1 час"
+    return "Бот активен! Следующая проверка новостей через 5 минут"
 
 @app.route('/check-now')
 def manual_check():
@@ -495,14 +500,6 @@ def health_check():
     return "OK", 200
 
 if __name__ == '__main__':
-    # Первая проверка при запуске
-    try:
-        logger.info("Запуск первой проверки новостей...")
-        check_feeds()
-        logger.info("Первая проверка завершена")
-    except Exception as e:
-        logger.error(f"Ошибка при первом запуске: {e}")
-    
     # Запускаем Flask
     port = int(os.environ.get('PORT', 10000))
     logger.info(f"Запуск Flask приложения на порту {port}")
