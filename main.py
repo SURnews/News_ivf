@@ -340,7 +340,7 @@ RSS_FEEDS = [
     # Китайские
     'http://www.xinhuanet.com/english/rss/healthrss.xml',
     'https://www.chinanews.com/rss/health.shtml',
-    'hhttps://www.scmp.com/rss/4/feed',  # Health section
+    'https://www.scmp.com/rss/4/feed',  # Health section
     
     # Японские
     'https://www.nikkei.com/rss/news/cate/health.html',
