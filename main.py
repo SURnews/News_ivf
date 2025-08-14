@@ -1,1033 +1,506 @@
-# ivf_news_aggregator.py
-import sys
-import importlib.util
-import os
-import logging
-import logging.handlers
-import hashlib
-import time
-import json
-import re
-import asyncio
 import feedparser
-import httpx
-import numpy as np
-from datetime import datetime, timedelta
-from sqlalchemy import create_engine, Column, String, Text, JSON, DateTime
-from sqlalchemy.orm import declarative_base, sessionmaker, scoped_session
-from sqlalchemy.exc import SQLAlchemyError
-from contextlib import contextmanager
-from dotenv import load_dotenv
-from telegram import Bot, Update
-from telegram.error import TelegramError, RetryAfter
-from telegram.ext import ApplicationBuilder, CommandHandler, CallbackContext
-from http.server import BaseHTTPRequestHandler, HTTPServer
-import threading
-
-import tracemalloc
-tracemalloc.start(25)
-
-
-# Патч для модуля cgi в Python 3.13+
-if sys.version_info >= (3, 13):
-    cgi_spec = importlib.util.spec_from_loader('cgi', loader=None)
-    cgi_module = importlib.util.module_from_spec(cgi_spec)
-    sys.modules['cgi'] = cgi_module
-
-    def escape(s, quote=True):
-        replacements = {
-            '&': '&amp;',
-            '<': '&lt;',
-            '>': '&gt;',
-            '"': '&quot;' if quote else '"',
-            "'": '&#x27;' if quote else "'"
-        }
-        return ''.join(replacements.get(c, c) for c in s)
-
-    cgi_module.escape = escape
-
-from dotenv import load_dotenv
-
-# === ЗАГРУЗКА ОКРУЖЕНИЯ ===
-load_dotenv()
-
-# 🎯 ОТДЕЛЬНЫЙ ЛОГГЕР ДЛЯ БД - ДОБАВИТЬ ИМЕННО ЗДЕСЬ:
-db_logger = logging.getLogger('database')
-db_logger.setLevel(logging.INFO)
-
-# Настройка отдельного форматирования для БД
-db_handler = logging.StreamHandler()
-db_handler.setFormatter(logging.Formatter(
-    '%(asctime)s - 🗄️ [DATABASE] - %(levelname)s - %(message)s'
-))
-db_logger.addHandler(db_handler)
-db_logger.propagate = False  # Не дублировать в основном логе
-
+import telebot
+import os
+import re
+import time
+import hashlib
+import urllib.parse
+import psycopg2
+from urllib.parse import urlparse as url_parse
+from apscheduler.schedulers.background import BackgroundScheduler
+from flask import Flask, request
+import logging
+from urllib.parse import parse_qs, urlunparse, urlencode
+from googletrans import Translator
+import deepl
+import html
+import sys
+from datetime import datetime
 
 # Настройка логирования
 logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.StreamHandler(),
-        logging.FileHandler("aggregator.log"),
-        logging.handlers.RotatingFileHandler(  
-            "aggregator.log", maxBytes=10*1024*1024, backupCount=5
-        )
-    ]
+format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+level=logging.INFO
 )
-logger = logging.getLogger("IVFNewsAggregator")
+logger = logging.getLogger(__name__)
 
-# Конфигурация
-class Config:
-    # Режим работы AI: 'local' или 'api'
-    AI_MODE = os.getenv("AI_MODE", "local").lower()
-    AI_API_URL = os.getenv("AI_API_URL")
-    AI_MODEL = os.getenv("AI_MODEL")
-    AI_API_KEY = os.getenv("AI_API_KEY")
-    AI_TEMPERATURE = float(os.getenv("AI_TEMPERATURE", 0.7))
-    AI_MAX_TOKENS = int(os.getenv("AI_MAX_TOKENS", 350))
-    
-    # Настройки базы данных
-    DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://user:password@localhost/dbname")
-    @classmethod  
-    def get_database_url(cls):
-        """Получить правильно отформатированный URL для SQLAlchemy"""
-        database_url = cls.DATABASE_URL
-        if not database_url:
-            raise RuntimeError("DATABASE_URL не установлен в переменных окружения")
+# Токен и канал из переменных окружения
+TOKEN = os.getenv('TELEGRAM_TOKEN')
+CHANNEL = os.getenv('TELEGRAM_CHANNEL')
+DEEPL_API_KEY = os.getenv('DEEPL_API_KEY')
+DATABASE_URL = os.getenv('DATABASE_URL')  # Для PostgreSQL
 
-        # Конвертация для SQLAlchemy с psycopg2
-        if database_url.startswith("postgres://"):
-            database_url = database_url.replace("postgres://", "postgresql+psycopg2://", 1)
-        elif database_url.startswith("postgresql://") and "psycopg2" not in database_url:
-            database_url = database_url.replace("postgresql://", "postgresql+psycopg2://", 1)
+# Проверка обязательных переменных
+if not TOKEN or not CHANNEL or not DATABASE_URL:
+logger.error("Не заданы обязательные переменные окружения!")
+sys.exit(1)
 
-        return database_url
+# Инициализация переводчиков
+translator = Translator()
+deepl_translator = None
+if DEEPL_API_KEY:
+try:
+deepl_translator = deepl.Translator(DEEPL_API_KEY)
+except Exception as e:
+logger.error(f"Ошибка инициализации DeepL: {e}")
 
-    # Настройки Telegram
-    TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-    GROUP_CHAT_ID = os.getenv("GROUP_CHAT_ID", "@Futurefamilylab")
-    
-    # Параметры сбора новостей
-    CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", 1800))  # 30 минут
-    MAX_TEXT_LENGTH = 4096
-    EMBEDDING_UPDATE_INTERVAL = 1800  # 30 минут
-    MAX_NEWS_PER_CYCLE = 10  # Ограничение новых новостей за цикл
-    
-    # Обновленные рабочие RSS-фиды
-    RSS_FEEDS = [
-        "https://rssexport.rbc.ru/rbcnews/news/30/full.rss",
-        "https://news.search.yahoo.com/search;_ylt=Awrhbcnaco5oAwIAl.ZXNyoA;_ylu=Y29sbwNiZjEEcG9zAzEEdnRpZAMEc2VjA3Nj?p=surrogacy&fr=yfp-t&fr2=p%3As%2Cv%3Aw%2Cm%3Anewsdd_bn_m%2Cct%3Abing",
-        "https://www.fertilitynetworkuk.org/feed/",
-        "https://www.news-medical.net/tag/feed/ivf.aspx",
-        "https://www.technologyreview.com/feed/",
-        "https://www.sciencedaily.com/rss/health_medicine/fertility.xml",
-        "https://www.medicalnewstoday.com/categories/fertility/rss",
-        "https://www.straitstimes.com/news/health/rss",
-        "https://www.eurekalert.org/news/rss/health.xml",
-        "https://www.nature.com/subjects/health-care.rss",
-        "https://www.lemonde.fr/sante/rss_full.xml",
-        "https://www.spiegel.de/gesundheit/index.rss",
-        "https://www.repubblica.it/salute/rss",
-        "https://www.japantimes.co.jp/feed/tag/health/",
-        "http://www.xinhuanet.com/english/rss/healthrss.xml",
-        "https://news.google.com/search?q=%22IVF%7CFertility%7CEmbryo%7CPGT%7CSurrogacy%7CSpermDonation%7CEggDonation%7CFertilityLaw%22&hl=en-US&gl=US&ceid=US%3Aen",  
-        "https://news.google.com/rss/search?q=IVF%7CFertility%7CEmbryo%7CPGT%7CSurrogacy%7CSpermDonation%7CEggDonation%7CFertilityLaw&hl=ru-RU&gl=US&ceid=US:ru",
-        'https://www.lefigaro.fr/rss/figaro_sante.xml',
-        'https://news.google.com/rss/search?q=IVF%7CFertility%7CEmbryo%7CPGT%7CSurrogacy%7CSpermDonation%7CEggDonation%7CFertilityLaw&hl=ru-RU&gl=US&ceid=US:ru',
-        'https://www.elmundo.es/rss/salud.xml',
-        'https://xml2.corriereobjects.it/rss/salute.xml',
-        'https://www.lastampa.it/rss/salute',
-        'https://www.scmp.com/rss/4/feed',
-        'https://www.abc.es/rss/feeds/abc_Salud.xml',
-        'https://elpais.com/salud-y-bienestar/rss/',
-        'https://www.faz.net/aktuell/gesundheit/rss.xml',
-        'https://www.liberation.fr/sante/rss',
-        'https://news.google.com/rss/search?q=IVF+Fertility+Embryo+PGT+Surrogacy+SpermDonation+EggDonation+FertilityLaw&hl=ru&gl=RU&ceid=RU:ru',
-        'https://ccrmivf.com/feed',
-        'https://doctoreko.ru/news/rss',
-        'https://www.sciencedaily.com/rss/health_medicine/fertility.xml',
-        'https://www.sciencedaily.com/rss/health_medicine/gynecology.xml', 
-        'https://www.sciencedaily.com/rss/health_medicine/pregnancy_and_childbirth.xml', 
-        'https://www.nature.com/subjects/embryology.rss',
-        'https://www.sciencedaily.com/rss/plants_animals/genetics.xml', 
-        'https://www.sciencedaily.com/rss/health_medicine/genes.xml',
-        'https://www.sciencedaily.com/rss/health_medicine/stem_cells.xml',
-        'https://www.sciencedaily.com/rss/plants_animals/developmental_biology.xml', 
-        'https://www.sciencedaily.com/rss/health_medicine/epigenetics.xml',
-        'https://www.sciencedaily.com/rss/health_medicine/birth_defects.xml',
-        'https://www.sciencedaily.com/rss/health_medicine/gene_therapy.xml',
-        'https://www.sciencedaily.com/rss/plants_animals/cloning.xml',
-        'https://elementy.ru/rss/news',
-        'http://rss.sciam.com/basic-science', 
-        'https://www.sciencedaily.com/rss/all.xml', 
-        'https://www.sciencedaily.com/rss/top/health.xml',  
-        'https://www.sciencedaily.com/rss/top/science.xml', 
-        'https://www.theguardian.com/science/rss',
-        'https://www.technologyreview.com/feed/',
-        'https://www.sciencedaily.com/rss/science_society/bioethics.xml',
-        'https://www.theguardian.com/rss',
+# Глобальный список трекинговых параметров для удаления
+TRACKING_PARAMS = {
+'utm_source', 'utm_medium', 'utm_campaign', 'utm_term', 'utm_content',
+'ref', 'referral', 'source', 'fbclid', 'gclid', 'yclid', '_openstat',
+'campaign', 'mc_cid', 'mc_eid', 'session_id', 'icid', 'trk', 'trk_contact',
+'utm_referrer', 'utm_reader', 'utm_place', 'fb_action_ids', 'fb_action_types',
+'fb_ref', 'ga_source', 'ga_medium', 'ga_term', 'ga_content', 'ga_campaign',
+'pk_source', 'pk_medium', 'pk_campaign'
+}
 
-    ]
-    
-    # Ключевые слова для фильтрации новостей
-    KEYWORDS = [
-        'ivf', 'fertility', 'эко', 'фертильность', 'embryo', 'эмбрион', 'egg donation',
-        'in vitro', 'искусственное оплодотворение', 'репродукция', 'surrogacy',
-        'infertility', 'бесплодие', 'egg freezing', 'криоконсервация',
-        'sperm donation', 'донорство спермы', 'embryo transfer', 'перенос эмбрионов',
-        'fertility treatment', 'лечение бесплодия', 'assisted reproduction',
-        'вспомогательные репродуктивные технологии', 'плод', 'зачатие'
-    ]
+# Подключение к базе данных PostgreSQL
+def get_db_connection():
+try:
+conn = psycopg2.connect(DATABASE_URL, sslmode='require')
+return conn
+except Exception as e:
+logger.error(f"Ошибка подключения к базе данных: {e}")
+raise
 
-    # Модели для локального ИИ
-    LOCAL_AI_MODELS = {
-        "embedding": "sentence-transformers/all-MiniLM-L6-v2",
-        "summarization": "IlyaGusev/rut5_base_sum_gazeta",
-        "translation": "Helsinki-NLP/opus-mt-en-ru"
-    }
-    
-    # Медицинский глоссарий (исправлено: добавлена запятая после "гестация")
-    MEDICAL_GLOSSARY = {
-        "ivf": "ЭКО",
-        "in vitro fertilization": "экстракорпоральное оплодотворение",
-        "embryo": "эмбрион",
-        "implantation": "имплантация",
-        "fertility": "фертильность",
-        "blastocyst": "бластоциста",
-        "ovarian stimulation": "стимуляция яичников",
-        "sperm": "сперматозоид",
-        "oocyte": "ооцит",
-        "zygote": "зигота",
-        "gestation": "гестация",  # Исправлено: добавлена запятая
-        "PGT": "ПГТ (преимплантационное генетическое тестирование)",
-        "ICSI": "ИКСИ (интрацитоплазматическая инъекция сперматозоида)",
-        "ovulation induction": "индукция овуляции",
-        "endometrium": "эндометрий",
-        "follicle": "фолликул",
-        "gamete": "гамета",
-        "zygote intrafallopian transfer": "зиготный внутрифаллопиевый перенос",
-        "surrogacy": "суррогатное материнство"
-    }
+# Создание таблицы при первом запуске
+def init_db():
+try:
+conn = get_db_connection()
+cursor = conn.cursor()
+cursor.execute('''
+           CREATE TABLE IF NOT EXISTS sent_news (
+               normalized_link TEXT,
+               original_link TEXT,
+               title TEXT,
+               title_hash TEXT,
+               pubdate TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+               PRIMARY KEY (normalized_link, title_hash)
+           )
+       ''')
+cursor.execute('''
+           CREATE INDEX IF NOT EXISTS idx_title_hash 
+           ON sent_news(title_hash)
+       ''')
+conn.commit()
+logger.info("Таблица sent_news успешно создана или уже существует")
+except Exception as e:
+logger.error(f"Ошибка при инициализации базы данных: {e}")
+# Попытка повторного создания таблицы
+try:
+cursor.execute('''
+               CREATE TABLE IF NOT EXISTS sent_news (
+                   normalized_link TEXT,
+                   original_link TEXT,
+                   title TEXT,
+                   title_hash TEXT,
+                   pubdate TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                   PRIMARY KEY (normalized_link, title_hash)
+               )
+           ''')
+conn.commit()
+logger.info("Таблица создана после повторной попытки")
+except Exception as e2:
+logger.error(f"Критическая ошибка при создании таблицы: {e2}")
+sys.exit(1)
+finally:
+if conn:
+conn.close()
 
-# Модель базы данных
-Base = declarative_base()
+# Инициализация базы при старте
+init_db()
 
-class NewsItem(Base):
-    __tablename__ = 'news'
+bot = telebot.TeleBot(TOKEN)
 
-    id = Column(String(32), primary_key=True)
-    url = Column(String(1024), unique=True)
-    title = Column(String(512))
-    original_text = Column(Text)
-    summary = Column(Text)
-    image_url = Column(String(1024), nullable=True)
-    embedding = Column(JSON)              # эмбеддинг полного текста
-    summary_embedding = Column(JSON)      # эмбеддинг summary
-    published_at = Column(DateTime, default=datetime.utcnow)
+# Функция для вычисления хеша заголовка
+def get_title_hash(title):
+"""Вычисляет SHA-256 хеш для заголовка"""
+clean_title = title.strip().lower()
+return hashlib.sha256(clean_title.encode('utf-8')).hexdigest()
 
-    def __repr__(self):
-        return f"<NewsItem({self.title})>"
-    
-# Вспомогательные функции
-async def is_valid_article(url: str, client: httpx.AsyncClient) -> bool:
-    try:
-        response = await client.head(url, follow_redirects=True, timeout=10.0)
-        return response.status_code == 200 and 'html' in response.headers.get('content-type', '')
-    except Exception as e:
-        logger.warning(f"Invalid article URL: {url} ({e})")
-        return False
+def translate_text(text, src='auto', dest='ru'):
+"""Переводит текст на русский язык с использованием доступных сервисов"""
+if not text.strip():
+return text
 
-async def fetch_full_text(url: str, client: httpx.AsyncClient) -> str:
-    try:
-        response = await client.get(url, timeout=15.0)
-        response.raise_for_status()
-        paragraphs = re.findall(r'<p[^>]*>(.*?)</p>', response.text, re.DOTALL)
-        text = '\n'.join(re.sub('<[^<]+?>', '', p) for p in paragraphs)
-        return text[:Config.MAX_TEXT_LENGTH].strip()
-    except Exception as e:
-        logger.warning(f"Failed to extract full text from {url}: {e}")
-        return ''
+try:
+# Пробуем DeepL если доступен
+if deepl_translator:
+result = deepl_translator.translate_text(text, target_lang=dest)
+return result.text
 
-def build_telegram_message(news_item, ai_summary):
-    # Убираем лишнее форматирование из текста
-    cleaned_summary = re.sub(r'(#{1,6}\s*\**|\**\s*$)', '', ai_summary)
-    cleaned_summary = re.sub(r'[#*_]{2,}', '', cleaned_summary)
-    
-    # Добавляем эмодзи к ключевым элементам
-    cleaned_summary = cleaned_summary.replace("Почему", "🔬 <b>Почему")
-    cleaned_summary = cleaned_summary.replace("Исследование опубликовано", "📚 Исследование опубликовано")
-    cleaned_summary = cleaned_summary.replace("{link_placeholder}", "")
-    
-    # Форматируем ссылку - только слово "Источник" будет кликабельным
-    source_link = f'<a href="{news_item.url}">Источник</a>'    
-    message = f"{cleaned_summary}\n\n📖 {source_link}"
+# Используем Google Translate как резервный вариант
+translation = translator.translate(text, src=src, dest=dest)
+return translation.text
+except Exception as e:
+logger.error(f"Ошибка перевода: {e}")
+return text  # Возвращаем оригинальный текст в случае ошибки
 
-    # Ограничиваем длину и добавляем многоточие при обрезке
-    max_length = Config.MAX_TEXT_LENGTH
-    suffix_length = len(suffix) + 4  # +4 для " ..."
-    available_length = max_length - suffix_length
-    
-    # Обрезаем основной текст до доступной длины
-    if len(cleaned_summary) > available_length:
-    # Ищем естественное место для обрыва
-        cutoff_point = cleaned_summary[:available_length].rfind('. ')
-        if cutoff_point == -1:
-            cutoff_point = cleaned_summary[:available_length].rfind(' ')
-        
-        if cutoff_point > 0:
-            main_text = cleaned_summary[:cutoff_point] + '...'
-        else:
-            main_text = cleaned_summary[:available_length-3] + '...'
-    else:
-        main_text = cleaned_summary
-    
-    return main_text + suffix
+def normalize_url(url):
+"""Улучшенная нормализация URL с удалением трекинговых параметров"""
+try:
+parsed = url_parse(url)
 
-# Класс для работы с базой данных
-class Database:
-    def __init__(self):
-        self.engine = None
-        self.session_factory = None
-        self.Session = None
+# Приводим домен к нижнему регистру и удаляем www
+netloc = parsed.netloc.lower()
+if netloc.startswith('www.'):
+netloc = netloc[4:]
 
-    def init_db(self):
-        try:
-            database_url = Config.get_database_url()
-            self.engine = create_engine(
-                database_url,
-                pool_size=10,
-                max_overflow=5,
-                pool_recycle=3600,
-                pool_pre_ping=True,
-                connect_args={
-                    "sslmode": "require",
-                    "connect_timeout": 10,
-                    "application_name": "ivf_news_bot"
-                }
-            )
-            Base.metadata.create_all(self.engine)
-            self.session_factory = sessionmaker(
-                bind=self.engine,
-                autocommit=False,
-                autoflush=False,
-                expire_on_commit=False
-            )
-            self.Session = scoped_session(self.session_factory)
-            db_logger.info("База данных инициализирована")
-            self.test_connection()
-        except Exception as e:
-            db_logger.error(f"Ошибка инициализации БД: {e}")
-            raise
+# Удаляем якорь
+parsed = parsed._replace(fragment="", netloc=netloc)
 
-    def test_connection(self):
-        try:
-            with self.session_scope() as s:
-                s.execute("SELECT 1").fetchone()
-            db_logger.info("✅ Подключение к Supabase успешно")
-        except Exception as e:
-            db_logger.error(f"❌ Ошибка подключения: {e}")
-            raise
+# Фильтрация параметров запроса
+if parsed.query:
+query_params = parse_qs(parsed.query, keep_blank_values=True)
+filtered_params = {}
 
-    @contextmanager
-    def session_scope(self):
-        s = self.Session()
-        try:
-            yield s
-            s.commit()
-        except:
-            s.rollback()
-            raise
-        finally:
-            s.close()
+for key, values in query_params.items():
+# Приводим ключ к нижнему регистру для проверки
+key_lower = key.lower()
 
-    def save_news(self, news_item):
-        with self.session_scope() as s:
-            s.merge(news_item)
+# Сохраняем только нетрекинговые параметры
+if key_lower not in TRACKING_PARAMS:
+filtered_params[key] = values
 
-    def is_url_processed(self, url):
-        url_hash = hashlib.md5(url.encode()).hexdigest()
-        with self.session_scope() as s:
-            return s.get(NewsItem, url_hash) is not None
+# Сортируем параметры для единообразия
+sorted_params = sorted(filtered_params.items(), key=lambda x: x[0])
+new_query = urlencode(sorted_params, doseq=True)
+parsed = parsed._replace(query=new_query)
 
-    def is_summary_duplicate(self, summary_text):
-        with self.session_scope() as s:
-            return s.query(NewsItem).filter(NewsItem.summary == summary_text).first() is not None
+# Убираем дублирующиеся слэши в пути
+path = re.sub(r'/{2,}', '/', parsed.path)
+parsed = parsed._replace(path=path)
 
-    def get_all_embeddings(self, max_age_days=30):
-        cutoff = datetime.utcnow() - timedelta(days=max_age_days)
-        with self.session_scope() as s:
-            rows = s.query(NewsItem.id, NewsItem.embedding)\
-                    .filter(NewsItem.published_at >= cutoff)\
-                    .all()
-            result = []
-            for rid, emb in rows:
-                if emb:
-                    try:
-                        result.append((rid, np.array(emb)))
-                    except Exception:
-                        pass
-            return result
+return urlunparse(parsed)
+except Exception as e:
+logger.error(f"Ошибка нормализации URL {url}: {e}")
+return url
 
-# Класс для ИИ-обработки новостей
-class AIProcessor:
-    _instance = None
-    
-    def __new__(cls):
-        if cls._instance is None:
-            cls._instance = super().__new__(cls)
-            # Асинхронный HTTP-клиент
-            cls._instance.http_client = httpx.AsyncClient(timeout=60.0)
-            cls._instance.init_ai()
-        return cls._instance
-    
-    def init_ai(self):
-        self.mode = Config.AI_MODE
-        self.model_initialized = False
-        
-        if self.mode == "local":
-            self.load_local_models()
-        elif self.mode == "api":
-            self.model_initialized = True
-            logger.info("API mode initialized")
-        else:
-            raise ValueError(f"Unsupported AI mode: {self.mode}")
-    
-    def load_local_models(self):
-        try:
-            import torch
-            from transformers import pipeline, AutoTokenizer, AutoModelForSeq2SeqLM
-            from sentence_transformers import SentenceTransformer
-            
-            self.device = "cuda" if torch.cuda.is_available() else "cpu"
-            logger.info(f"Loading LOCAL models on {self.device.upper()}")
-            
-            self.embedding_model = SentenceTransformer(
-                Config.LOCAL_AI_MODELS["embedding"], 
-                device=self.device
-            )
-            
-            self.sum_tokenizer = AutoTokenizer.from_pretrained(
-                Config.LOCAL_AI_MODELS["summarization"]
-            )
-            self.sum_model = AutoModelForSeq2SeqLM.from_pretrained(
-                Config.LOCAL_AI_MODELS["summarization"]
-            ).to(self.device)
-            
-            self.translator = pipeline(
-                "translation", 
-                model=Config.LOCAL_AI_MODELS["translation"],
-                device=0 if self.device == "cuda" else -1
-            )
-            
-            logger.info("LOCAL AI models loaded")
-            self.model_initialized = True
-        except Exception as e:
-            logger.error(f"Error loading LOCAL AI models: {str(e)}")
-            self.model_initialized = False
-    
-    def generate_embedding(self, text):
-        if self.mode == "api":
-            return np.zeros(384)
-        
-        if not hasattr(self, 'embedding_model'):
-            try:
-                from sentence_transformers import SentenceTransformer
-                self.embedding_model = SentenceTransformer(
-                    Config.LOCAL_AI_MODELS["embedding"]
-                )
-            except Exception as e:
-                logger.error(f"Failed to load embedding model: {str(e)}")
-                return np.zeros(384)
-            
-        return self.embedding_model.encode([text[:Config.MAX_TEXT_LENGTH]])[0]
-    
-    def is_duplicate(self, embedding, db_embeddings, threshold=0.85):
-        if self.mode == "api" or not db_embeddings or not self.model_initialized:
-            return False, None
-        
-        embedding = np.array(embedding)
-        max_similarity = 0
-        max_item_id = None
-        
-        for item_id, db_emb in db_embeddings:
-            norm = np.linalg.norm(embedding) * np.linalg.norm(db_emb)
-            if norm == 0:
-                continue
-            similarity = np.dot(embedding, db_emb) / norm
-            if similarity > max_similarity:
-                max_similarity = similarity
-                max_item_id = item_id
-        
-        return (max_similarity > threshold, max_item_id)
-    
-    def apply_medical_glossary(self, text):
-        for eng, ru in Config.MEDICAL_GLOSSARY.items():
-            text = re.sub(rf'\b{eng}\b', f'<b>{ru}</b>', text, flags=re.IGNORECASE)
-        return text
-    
-    async def process_content(self, text):
-        # Применяем глоссарий перед обработкой
-        text = self.apply_medical_glossary(text)
-        
-        # Улучшенная обработка структуры текста
-        text = re.sub(r'(Почему\s.+?:)', r'🔬 <b>\1</b>', text)
-        text = re.sub(r'(Важность\s.+?:)', r'⭐ <b>\1</b>', text)
-        text = re.sub(r'(Как\s.+?:)', r'⚙️ <b>\1</b>', text)
-        
-        if not self.model_initialized:
-            return text[:Config.MAX_TEXT_LENGTH]
-        
-        if self.mode == "api":
-            return await self.process_with_api(text)
-        
-        # Локальная обработка
-        return text[:Config.MAX_TEXT_LENGTH]
-    
-    async def process_with_api(self, text):
-        """Обработка текста через внешний AI API"""
-        if not Config.AI_API_KEY:
-            logger.error("AI_API_KEY is not set! Using fallback")
-            return text[:200]
-        
-        for attempt in range(3):
-            try:
-                headers = {
-                    "Authorization": f"Bearer {Config.AI_API_KEY}",
-                    "Content-Type": "application/json"
-                }
-                
-                # Улучшенный промпт для OpenRouter
-                prompt = (
-                    "Ты профессиональный редактор медицинских новостей для Telegram-канала по репродуктивной медицине. "
-                    "Создай адаптированный для Telegram текст по следующим правилам:\n\n"
-                
-                    "🔥 <b>Форматирование для Telegram:</b>\n"
-                    "1. Заголовок: один лаконичный заголовок на русском языке в начале (без английского дубля)\n"
-                    "2. Структура: короткие абзацы (2-4 предложения), разделенные пустой строкой\n"
-                    "3. Разметка: используй <b>жирный</b> для ключевых терминов и <i>курсив</i> для важных акцентов\n"
-                    "4. Эмодзи: добавляй релевантные эмодзи для визуального разделения блоков\n"
-                    "5. НИКОГДА не включай ссылки или упоминания 'источник' в тексте!\n\n"
-                    "6. Длина: до 600 слов, оптимизировано под мобильное чтение\n\n"
-                
-                    "🔬 <b>Содержательные требования:</b>\n"
-                    "1. Первый абзац: суть открытия и его значение для репродуктологии\n"
-                    "2. Основная часть: объяснение механизмов и научной новизны\n"
-                    "3. Концовка: практические перспективы применения открытия\n"
-                    "4. Обязательно включи:\n"
-                    "   - Авторов и журнал публикации\n"
-                    "   - Дату исследования\n"
-                    "   - Клиническую значимость для ЭКО\n\n"
-                
-                    "⚡ <b>Стилистика:</b>\n"
-                    "1. Научно-популярный стиль с элементами научной строгости\n"
-                    "2. Используй активные конструкции: \"Ученые обнаружили\" вместо \"Было обнаружено\"\n"
-                    "3. Добавь 1-2 цитаты экспертов (даже если их нет в оригинале)\n"
-                    "4. Соблюдай медицинскую точность терминов:\n"
-                    "   - Эмбрион (до 8 недель) → Плод (после 8 недель)\n"
-                    "   - Корректное использование: ПГТ, ИКСИ, криоконсервация и т.д.\n\n"
-                
-                    "🚫 <b>Запрещено:</b>\n"
-                    "- Упоминания источников или ссылок\n"
-                    "- Английские заголовки и дубли\n"
-                    "- Маркдаун-разметка (##, **)\n"
-                    "- Длинные сложные предложения (>25 слов)\n"
-                    "- Технические детали без пояснений\n\n"
-                
-                    "🌟 <b>Примеры разнообразных структур:</b>\n"
-                    "Пример 1 (клиническое исследование):\n"
-                    "<b>Новый протокол стимуляции повышает эффективность ЭКО на 30%</b>\n\n"
-                    "🔬 Исследователи из Каролинского института представили инновационный подход к контролируемой стимуляции яичников. "
-                    "Метод снижает риск синдрома гиперстимуляции при сохранении эффективности.\n\n"
-                    "🧪 Технология основана на...\n\n"
-                    "💡 Для пациентов это означает...\n\n"
-                    "👨‍⚕️ Профессор Андерссон: \"Это революция в подходах к...\"\n\n"
-                    "📚 Journal of Assisted Reproduction, 10 октября 2025\n\n"
-                    
-                    "Пример 2 (технологический прорыв):\n"
-                    "<b>Искусственный интеллект предсказывает успех имплантации эмбриона</b>\n\n"
-                    "🤖 Алгоритм DeepIVF, разработанный в MIT, анализирует морфокинетические параметры эмбрионов с точностью 92%...\n\n"
-                    "⚙️ Как работает система...\n\n"
-                    "🏥 Внедрение в клиниках ожидается...\n\n"
-                    
-                    "Пример 3 (социальный аспект):\n"
-                    "<b>Психологи представили программу поддержки для родителей после суррогатного материнства</b>\n\n"
-                    "🧠 Новая методика помогает семьям...\n\n"
-                    "❤️ Особое внимание уделяется...\n\n"
-                    "👶 Доктор Петрова: \"Эмоциональная связь формируется...\"\n\n"
-                    
-                    f"Исходный текст: {text[:3000]}"
-                                       
-                )
+def is_new(link, title):
+"""Проверяет новость по нормализованному URL и хешу заголовка"""
+normalized = normalize_url(link)
+title_hash = get_title_hash(title)
 
-                payload = {
-                    "model": Config.AI_MODEL,
-                    "messages": [{
-                        "role": "user",
-                        "content": prompt
-                    }],
-                    "temperature": Config.AI_TEMPERATURE,
-                    "max_tokens": Config.AI_MAX_TOKENS
-                }
-                
-                # Асинхронный запрос с использованием httpx
-                response = await self.http_client.post(
-                    Config.AI_API_URL,
-                    headers=headers,
-                    json=payload,
-                    timeout=60
-                )
-                response.raise_for_status()
-                result = response.json()
-                
-                # Обработка ответа OpenRouter
-                return result['choices'][0]['message']['content'].strip()
-            except Exception as e:
-                logger.error(f"AI API error (attempt {attempt+1}/3): {str(e)}")
-                if attempt < 2:
-                    await asyncio.sleep(2 ** attempt)  # Экспоненциальная задержка
-                else:
-                    return text[:200]
+try:
+conn = get_db_connection()
+cursor = conn.cursor()
+cursor.execute('''
+           SELECT 1 FROM sent_news 
+           WHERE normalized_link = %s AND title_hash = %s
+       ''', (normalized, title_hash))
+return cursor.fetchone() is None
+except Exception as e:
+logger.error(f"Ошибка проверки новости: {e}")
+return True  # В случае ошибки считаем новость новой
+finally:
+if conn:
+conn.close()
 
-    def translate_to_russian(self, text):
-        if not self.model_initialized:
-            return text
-            
-        text = self.apply_medical_glossary(text[:Config.MAX_TEXT_LENGTH])
-        try:
-            return self.translator(text)[0]['translation_text']
-        except Exception as e:
-            logger.error(f"Translation error: {str(e)}")
-            return text
-    
-    def detect_language(self, text):
-        return 'ru' if any('\u0400' <= char <= '\u04FF' for char in text) else 'en'
+def save_news(link, title):
+"""Сохраняет новость с нормализованным URL и хешем заголовка"""
+try:
+normalized = normalize_url(link)
+title_hash = get_title_hash(title)
 
-# Класс для отправки уведомлений в Telegram
-class TelegramNotifier:
-    def __init__(self, ai_processor=None):
-        self.token = Config.TELEGRAM_BOT_TOKEN
-        self.group_chat_id = Config.GROUP_CHAT_ID
-        self.ai = ai_processor
-        self.semaphore = asyncio.Semaphore(5)  # Ограничение параллельных отправок
-        
-        logger.info(f"Initializing Telegram bot with token: {self.token[:10]}...")
-        logger.info(f"Target group: {self.group_chat_id}")
-        
-        try:
-            self.bot = Bot(token=self.token)
-            logger.info("Telegram bot initialized with default timeouts")
-        except Exception as e:
-            logger.error(f"Failed to initialize Telegram bot: {str(e)}")
-            self.bot = None
-    
-    async def send_message(self, text: str):
-        if not self.bot:
-            logger.warning("Telegram bot not available")
-            return
-        
-        async with self.semaphore:
-            for attempt in range(3):
-                try:
-                    await self.bot.send_message(
-                        chat_id=self.group_chat_id,
-                        text=text,
-                        parse_mode="HTML"
-                    )
-                    logger.info("Telegram message sent")
-                    return
-                except RetryAfter as e:
-                    wait_time = e.retry_after
-                    logger.warning(f"Rate limited, retrying in {wait_time} seconds")
-                    await asyncio.sleep(wait_time)
-                except TelegramError as e:
-                    logger.error(f"Telegram send error (attempt {attempt+1}/3): {e}")
-                    if attempt < 2:
-                        await asyncio.sleep(2 ** attempt)  # Экспоненциальная задержка
-                    else:
-                        logger.error("Failed to send Telegram message after 3 attempts")
-                        return
-    
-    async def send_news(self, news_item):
+conn = get_db_connection()
+cursor = conn.cursor()
+cursor.execute('''
+           INSERT INTO sent_news 
+           (normalized_link, original_link, title, title_hash)
+           VALUES (%s, %s, %s, %s)
+           ON CONFLICT (normalized_link, title_hash) DO NOTHING
+       ''', (normalized, link, title, title_hash))
+conn.commit()
+logger.info(f"Сохранена новость: {title}")
+except Exception as e:
+logger.error(f"Ошибка при сохранении в базу: {e}")
+finally:
+if conn:
+conn.close()
 
-        if not news_item.summary:
-            logger.error("No summary for news item, skipping")
-            return
-        
-            message = build_telegram_message(news_item, news_item.summary)
-    
-        # Логирование для отладки
-        #logger.info(f"Prepared message: {message[:100]}...")
-        #logger.info(f"Image URL: {getattr(news_item, 'image_url', 'N/A')}")
-    
-        message = build_telegram_message(news_item, news_item.summary)
-        #image_url = getattr(news_item, 'image_url', None)
-        
-        try:
-            #if image_url:
-                # Проверяем валидность изображения
-                #async with httpx.AsyncClient() as client:
-                    #response = await client.head(image_url)
-                    #if response.status_code == 200 and 'image' in response.headers.get('content-type', ''):
-                        #await self.bot.send_photo(
-                            #chat_id=self.group_chat_id,
-                            #photo=image_url,
-                            #caption=message,
-                            #parse_mode="HTML"
-                        #)
-                        #return)
-                
-            # Если изображение невалидно или отсутствует
-            await self.bot.send_message(
-                chat_id=self.group_chat_id,
-                text=message,
-                parse_mode="HTML"
-            )
-        
-        except Exception as e:
-            logger.error(f"Failed to send news: {str(e)}")
-            # Фолбэк на текстовое сообщение
-            await self.bot.send_message(
-                chat_id=self.group_chat_id,
-                text=message,
-                parse_mode="HTML"
-            )
+def clean_html(raw_html):
+"""Удаляет HTML-теги из текста"""
+if not raw_html:
+return ""
+cleanr = re.compile('<.*?>')
+cleantext = re.sub(cleanr, '', raw_html)
+return html.unescape(cleantext)
 
-    async def handle_command(self, update: Update, context: CallbackContext):
-        if not self.ai:
-            await context.bot.send_message(
-                chat_id=update.effective_chat.id,
-                text="❌ AI processor not available"
-            )
-            return
-        
-        test_text = "In vitro fertilisation (IVF) is a process of fertilisation where an egg is combined with sperm in vitro."
-        result = await self.ai.process_content(test_text)
-        await context.bot.send_message(
-            chat_id=update.effective_chat.id,
-            text=f"AI Test Result:\n{result}"
-        )
-    
-    async def start_polling(self):
-        if not self.token:
-            logger.warning("Telegram token not set")
-            return
-            
-        try:
-            application = ApplicationBuilder().token(self.token).build()
-            application.add_handler(CommandHandler("test_ai", self.handle_command))
-            
-            logger.info("Starting Telegram polling")
-            await application.run_polling()
-        except Exception as e:
-            logger.error(f"Polling error: {str(e)}")
+def contains_topic(content):
+"""Проверяет, относится ли новость к нужной тематике с использованием регулярных выражений"""
+# Очищаем контент от HTML-тегов
+clean_content = clean_html(content).lower()
 
-# Основной класс новостного агрегатора
-class NewsAggregator:
-    def __init__(self):
-        self.db = Database()
-        self.db.init_db()
-        self.ai = AIProcessor()
-        self.notifier = TelegramNotifier(self.ai)
-        self.db_embeddings = []
-        self.last_embeddings_update = 0
-        self.news_counter = 0  # Счетчик новых новостей
-        
-        # Асинхронный HTTP-клиент для запросов RSS
-        self.http_client = httpx.AsyncClient(
-            headers={
-                "User-Agent": "Mozilla/5.0 (compatible; IVF-News-Aggregator/1.0)",
-                "Accept": "application/rss+xml, text/xml;q=0.9"
-            },
-            timeout=30.0,
-            follow_redirects=True
-        )
-        
-        # Обновление эмбеддингов при старте
-        self.update_embeddings()
-        
-        # Запуск слушателя Telegram в основном потоке
-        asyncio.create_task(self.notifier.start_polling())
-
-    def update_embeddings(self):
-        self.db_embeddings = self.db.get_all_embeddings()
-        self.last_embeddings_update = time.time()  # Исправлено last_embeddings_update
-        logger.info(f"Embeddings cache updated, {len(self.db_embeddings)} items")
-
-    async def safe_parse_feed(self, feed_url):
-        try:
-            response = await self.http_client.get(feed_url)
-            response.raise_for_status()
-            
-            # Проверка на валидность RSS
-            content_type = response.headers.get('Content-Type', '').lower()
-            if 'xml' not in content_type and 'rss' not in content_type:
-                logger.warning(f"Invalid content type for {feed_url}: {content_type}")
-                return None
-            
-            return feedparser.parse(response.content)
-        except Exception as e:
-            logger.error(f"Feed parse error [{feed_url}]: {str(e)}")
-            return None
-
-    def is_ivf_related(self, text: str) -> bool:
-        if not text:
-            return False
-        
-        # Проверка русских стоп-слов
-        stop_words = ['экономика', 'путин', 'ставка', 'банк', 
-                 'минэкономразвития', 'совфед', 'цб рф']
-        for word in stop_words:
-            if word in text.lower():
-                return False
-    
-        # Проверка ключевых слов
-        text_lower = text.lower()
-        for keyword in Config.KEYWORDS:
-            if keyword.lower() in text_lower:
-                return True
-            
-        # Проверка медицинского глоссария
-        for term in Config.MEDICAL_GLOSSARY.values():
-            if term.lower() in text_lower:
-                return True
-            
-        return False
-
-    async def process_feed(self, feed_url):
-        parsed = await self.safe_parse_feed(feed_url)
-        if not parsed or not parsed.entries:
-            return []
-
-        new_items = []
-        for entry in parsed.entries:
-            try:
-                if not hasattr(entry, 'link') or not entry.link:
-                    continue
-
-                # Уже обработанный URL?
-                if self.db.is_url_processed(entry.link):
-                    continue
-
-                # Предварительная фильтрация
-                title = entry.title[:512] if hasattr(entry, 'title') else ""
-                description = entry.get('description', '')[:5000]
-                preview_text = f"{title} {description}"
-                if not self.is_ivf_related(preview_text):
-                    continue
-
-                # Валидация статьи
-                if not await is_valid_article(entry.link, self.http_client):
-                    continue
-
-                # Полный текст
-                full_text = await fetch_full_text(entry.link, self.http_client)
-                title = entry.title[:512] if hasattr(entry, 'title') else "Без названия"
-                combined_text = f"{title}\n\n{description}\n\n{full_text}"[:Config.MAX_TEXT_LENGTH]
-
-                # Повторная фильтрация по полному тексту
-                if not self.is_ivf_related(combined_text):
-                    logger.info(f"Skipped non-IVF article: {title[:50]}...")
-                    continue
-
-                # Периодическое обновление кэша эмбеддингов
-                if time.time() - self.last_embeddings_update > Config.EMBEDDING_UPDATE_INTERVAL:
-                    loop = asyncio.get_event_loop()
-                    await loop.run_in_executor(None, self.update_embeddings)
-
-                # Эмбеддинг полного текста
-                embedding = self.ai.generate_embedding(combined_text)
-
-                # Дубликат по эмбеддингу полного текста?
-                is_dup, dup_id = self.ai.is_duplicate(embedding, self.db_embeddings)
-                if is_dup:
-                    logger.info(f"Duplicate by full text: {title[:20]}... similar to {dup_id}")
-                    continue
-
-                # Рерайт (summary) и эмбеддинг summary
-                summary = await self.ai.process_content(combined_text) if self.ai.model_initialized else combined_text[:200]
-                summary_embedding = self.ai.generate_embedding(summary)
-
-                # Дубликат по summary (точное совпадение)?
-                if self.db.is_summary_duplicate(summary):
-                    logger.info(f"Duplicate by summary: {title[:20]}...")
-                    continue
-
-                # Дата публикации
-                published_at = datetime.utcnow()
-                if hasattr(entry, 'published_parsed'):
-                    try:
-                        published_at = datetime(*entry.published_parsed[:6])
-                    except (TypeError, ValueError):
-                        pass
-
-                # Картинка (если есть)
-                image_url = None
-                if hasattr(entry, 'media_content') and entry.media_content:
-                    image_url = entry.media_content[0].get('url')
-                    if image_url:
-                        image_url = image_url[:1024]
-
-                # ID и сохранение
-                url_hash = hashlib.md5(entry.link.encode()).hexdigest()
-                news_item = NewsItem(
-                    id=url_hash,
-                    url=entry.link[:1024],
-                    title=title[:512],
-                    original_text=combined_text,
-                    summary=summary,
-                    embedding=embedding.tolist(),
-                    summary_embedding=summary_embedding.tolist(),
-                    published_at=published_at,
-                    image_url=image_url
-                )
-
-                self.db.save_news(news_item)
-                new_items.append(news_item)
-
-                # Обновить локальный кэш эмбеддингов
-                self.db_embeddings.append((url_hash, np.array(embedding)))
-
-                self.news_counter += 1
-                await self.notifier.send_news(news_item)
-
-                if self.news_counter >= Config.MAX_NEWS_PER_CYCLE:
-                    logger.info(f"Reached max news limit ({Config.MAX_NEWS_PER_CYCLE}) for this cycle")
-                    break
-
-            except Exception as e:
-                logger.error(f"Entry processing error: {str(e)}")
-
-        return new_items
+# Основные ключевые слова на разных языках
+patterns = [
+# Русский
+r'\bсуррогатн\w*\b', r'\bэко\b', r'\bвспомогательные репродуктивные\b', 
+r'\bвпр\b', r'\bдонорство ооцитов\b', r'\bдонорство спермы\b',
+r'\bсурмама\b', r'\bсуррогатной матери\b', r'\bрепродуктивн\w*\b',
+r'\bбесплодие\b', r'\bоплодотворение in vitro\b',
 
 
+# Английский
+r'\bsurrogacy\b', r'\bivf\b', r'\bassisted reproductive technology\b', 
+r'\bart\b', r'\begg donation\b', r'\bsperm donation\b',
+r'\bfertility treatment\b', r'\bin vitro fertilization\b',
+r'\bembryo transfer\b', r'\bsurrogate mother\b', r'\bfertility clinic\b',
+r'\breproductive medicine\b', r'\bgestational carrier\b',
 
-    async def run(self):
-        logger.info(f"Starting IVF News Aggregator [{Config.AI_MODE} AI mode]")
-        logger.info(f"Monitoring {len(Config.RSS_FEEDS)} feeds")
-        
-        if not self.ai.model_initialized:
-            logger.critical("AI initialization failed!")
-            await self.notifier.send_message("❌ IVF News Aggregator FAILED to start: AI not initialized!")
-            return
-        
-        # Проверка доступности Telegram
-        try:
-            await self.notifier.send_message("🤖 IVF News Aggregator started successfully!")
-        except Exception as e:
-            logger.error(f"Failed to send startup message to Telegram: {str(e)}")
-        
-        while True:
-            start_time = time.time()
-            logger.info(f"Processing cycle started")
-            self.news_counter = 0  # Сброс счетчика новостей
-            
-            total_new = 0
-            # Обработка фидов с ограничением скорости
-            for i, feed_url in enumerate(Config.RSS_FEEDS):
-                # Проверка лимита новостей
-                if self.news_counter >= Config.MAX_NEWS_PER_CYCLE:
-                    logger.info(f"Max news per cycle reached ({Config.MAX_NEWS_PER_CYCLE}), skipping remaining feeds")
-                    break
-                    
-                try:
-                    new_items = await self.process_feed(feed_url)
-                    total_new += len(new_items)
-                    logger.info(f"Feed processed: {feed_url} - {len(new_items)} new")
-                    
-                    # Задержка между фидами
-                    await asyncio.sleep(1)
-                    
-                except Exception as e:
-                    logger.error(f"Feed processing error: {str(e)}")
-            
-            cycle_time = time.time() - start_time
-            logger.info(f"Cycle completed: {total_new} new items, {cycle_time:.2f} sec")
-            
-            sleep_time = max(Config.CHECK_INTERVAL - cycle_time, 60)
-            logger.info(f"Sleeping for {sleep_time} seconds")
-            await asyncio.sleep(sleep_time)
+# Испанский
+r'\bmaternidad subrogada\b', r'\bfiv\b', r'\bdonación de óvulos\b', 
+r'\bdonación de esperma\b', r'\bgestación subrogada\b',
+r'\bfertilidad\b', r'\breproducción asistida\b',
 
+# Французский
+r'\bmère porteuse\b', r'\bpma\b', r'\bdon d’ovocytes\b', 
+r'\bdon de sperme\b', r'\bprocréation médicalement assistée\b',
+r'\bgestation pour autrui\b', r'\bfertilité\b',
 
-class HealthCheckHandler(BaseHTTPRequestHandler):
-    def do_GET(self):
-        self.handle_request()
-    
-    def do_HEAD(self):
-        self.handle_request()
-    
-    def handle_request(self):
-        if self.path == '/' or self.path == '/health':
-            self.send_response(200)
-            self.send_header('Content-type', 'text/plain')
-            self.end_headers()
-            if self.command == 'GET':
-                self.wfile.write(b'OK')
-        else:
-            self.send_response(404)
-            self.end_headers()
+# Немецкий
+r'\bleihmutterschaft\b', r'\bkünstliche befruchtung\b', r'\beizellspende\b',
+r'\bsamenspende\b', r'\breproduktionsmedizin\b', r'\bfruchtbarkeit\b',
+r'\bin-vitro-fertilisation\b',
 
-def run_http_server(port):
-    server_address = ('', port)
-    httpd = HTTPServer(server_address, HealthCheckHandler)
-    logger.info(f"Starting health check server on port {port}")
-    httpd.serve_forever()
+# Итальянский
+r'\bmaternità surrogata\b', r'\bgravidanza surrogata\b', r'\bdonazione di ovociti\b',
+r'\bdonazione di sperma\b', r'\bprocreazione medicalmente assistita\b',
+r'\bfertilita\b', r'\bfivet\b',
 
-# Асинхронная точка входа
-import atexit
-atexit.register(tracemalloc.stop)
+# Китайский
+r'\b代孕\b', r'\b试管婴儿\b', r'\b卵子捐赠\b', r'\b精子捐赠\b',  # Иероглифы
+r'\bdàiyùn\b', r'\bshìguǎn yīngér\b', r'\bluǎnzǐ juānzèng\b',  # Пиньинь
+r'\bjīngzǐ juānzèng\b', r'\b辅助生殖\b'
+]
 
-async def main():
-    """Главная асинхронная функция запуска новостного агрегатора"""
-    aggregator = None
-    
-    try:
-        # Инициализация агрегатора (убрано дублирование)
-        aggregator = NewsAggregator()
-        logger.info("Новостной агрегатор успешно инициализирован")
-        
-        # Запуск основного цикла (теперь ВНУТРИ try блока)
-        await aggregator.run()
-        
-    except asyncio.CancelledError:
-        logger.info("Задача агрегатора отменена")
-        
-    except Exception as e:
-        logger.critical(f"Критическая ошибка: {str(e)}")
-        logger.error("Проверьте переменную DATABASE_URL и доступность Supabase")
-        
-        # Уведомление об ошибке
-        if aggregator and hasattr(aggregator, 'notifier'):
-            try:
-                await aggregator.notifier.send_message(f"❌ IVF News Aggregator CRASHED: {str(e)}")
-            except Exception as notify_error:
-                logger.error(f"Не удалось отправить уведомление: {notify_error}")
-        
-        raise
-        
-    finally:
-        # Безопасное закрытие ресурсов
-        if aggregator:
-            try:
-                if hasattr(aggregator, 'http_client'):
-                    await aggregator.http_client.aclose()
-                if hasattr(aggregator, 'ai') and hasattr(aggregator.ai, 'http_client'):
-                    await aggregator.ai.http_client.aclose()
-                logger.info("HTTP-клиенты корректно закрыты")
-            except Exception as cleanup_error:
-                logger.warning(f"Ошибка при закрытии ресурсов: {cleanup_error}")
-# Точка входа
-if __name__ == "__main__":
-    # Запуск HTTP-сервера для Render.com
-    port = int(os.getenv("PORT", 8080))
-    http_thread = threading.Thread(target=run_http_server, args=(port,), daemon=True)
-    http_thread.start()
-    
-    # Запуск основного асинхронного цикла
-    try:
-        asyncio.run(main())
-    except KeyboardInterrupt:
-        logger.info("Aggregator stopped manually")
-    except Exception as e:
-        logger.critical(f"Unhandled exception: {str(e)}")
+# Проверка по всем паттернам
+for pattern in patterns:
+if re.search(pattern, clean_content, re.IGNORECASE):
+return True
+
+# Дополнительная проверка для аббревиатур
+if re.search(r'\bart\b', clean_content, re.IGNORECASE):
+# Проверка контекста для ART (чтобы исключить "искусство")
+context_keywords = [
+'репродуктивн', 'fertility', 'fiv', 'оплодотворен', 'reproduction',
+'reproducción', 'reprodução', 'fortplantning', 'воспроизведение'
+]
+if any(kw in clean_content for kw in context_keywords):
+return True
+
+return False
+
+# Расширенный список международных RSS-лент
+RSS_FEEDS = [
+# Русскоязычные
+'https://lenta.ru/rss/news',
+'https://rssexport.rbc.ru/rbcnews/news/30/full.rss',
+'https://tass.ru/rss/v2.xml',
+'https://rssexport.rbc.ru/rbcnews/news/30/full.rss',
+
+# Англоязычные
+'https://www.fertilitynetworkuk.org/feed/',
+'https://www.news-medical.net/tag/feed/ivf.aspx',
+'https://www.technologyreview.com/feed/',
+'https://www.sciencedaily.com/rss/health_medicine/fertility.xml',
+'https://www.nih.gov/about-nih/what-we-do/nih-almanac/rss-feed',
+'https://www.bbc.com/news/health/rss.xml',
+'https://www.reutersagency.com/feed/?taxonomy=best-sectors&post_type=best',
+'http://rss.cnn.com/rss/cnn_health.rss',
+'https://www.theguardian.com/society/health/rss',
+'https://rss.dw.com/rdf/rss_en-health',
+'https://rss.app/feeds/tiVcHni4RDHNFtfD.xml',
+'https://rss.app/feeds/tA3pGgONfk8afopJ.xml',
+'https://rss.app/feeds/tpZ1sVm5QS1xWvIX.xml',
+'https://rss.app/feeds/t8CQcj4rcyVo1blZ.xml',
+'https://rss.app/feeds/tCCWBg8ZL1srqv8P.xml',
+'https://rss.app/feeds/t0229xqehsbyeDIz.xml',
+
+# Французские
+'https://www.lemonde.fr/sante/rss_full.xml',
+'https://www.lefigaro.fr/rss/figaro_sante.xml',
+'https://rss.app/feeds/t0229xqehsbyeDIz.xml',
+'https://www.liberation.fr/arc/outboundfeeds/rss/section/sante/?outputType=xml',
+
+# Испанские
+'https://www.elmundo.es/rss/salud.xml',
+'https://www.abc.es/rss/feeds/abc_ultimas.xml',
+'https://elpais.com/sociedad/salud/rss',
+
+# Немецкие
+'https://www.spiegel.de/gesundheit/index.rss',
+'https://www.faz.net/aktuell/gesundheit/rss',
+'https://www.sueddeutsche.de/gesundheit/rss',
+
+# Итальянские
+'https://xml2.corriereobjects.it/rss/salute.xml',
+'https://www.repubblica.it/salute/rss',
+'https://www.lastampa.it/rss/salute',
+
+# Китайские
+'http://www.xinhuanet.com/english/rss/healthrss.xml',
+'https://www.chinanews.com/rss/health.shtml',
+    'https://rss.app/feeds/ttFoyntYCgEJFWNW.xml',
+'https://www.scmp.com/rss/4/feed',  # Health section
+
+# Японские
+'https://www.nikkei.com/rss/news/cate/health.html',
+
+# Корейские
+'https://www.koreabiomed.com/rss/news',
+
+# Португальские (Бразилия)
+'https://g1.globo.com/rss/g1/saude/',
+
+# Индийские
+'https://www.thehindu.com/sci-tech/health/rss'
+]
+
+def check_feeds():
+start_time = time.time()
+logger.info('Начало проверки новостей...')
+new_count = 0
+duplicate_count = 0
+irrelevant_count = 0
+
+for url in RSS_FEEDS:
+try:
+feed = feedparser.parse(url)
+if not feed.entries:
+logger.warning(f"Нет новостей в фиде: {url}")
+continue
+
+logger.info(f"Обработка фида: {url} ({len(feed.entries)} новостей)")
+
+for entry in feed.entries:
+try:
+# Проверяем время выполнения
+if time.time() - start_time > 240:  # 4 минуты
+logger.warning("Прерывание проверки из-за превышения времени")
+break
+
+link = entry.get('link', '')
+title = clean_html(entry.get('title', ''))
+summary = clean_html(entry.get('summary', entry.get('description', '')))
+
+if not link or not title:
+continue
+
+# Полный текст для анализа
+full_content = f"{title} {summary}".lower()
+
+# Усиленная проверка тематики
+if not contains_topic(full_content):
+irrelevant_count += 1
+logger.debug(f"Новость не по теме: {title}")
+continue
+
+# Проверка уникальности
+if is_new(link, title):
+# Задержка для избежания блокировки
+time.sleep(0.2)
+
+send_news(title, link)
+save_news(link, title)
+new_count += 1
+else:
+duplicate_count += 1
+logger.info(f"Дубликат новости: {title} | URL: {normalize_url(link)}")
+except Exception as e:
+logger.error(f"Ошибка при обработке новости: {e}")
+
+except Exception as e:
+logger.error(f"Ошибка при обработке RSS {url}: {e}")
+time.sleep(2)  # Задержка при ошибках
+
+# Очистка старых записей
+try:
+conn = get_db_connection()
+cursor = conn.cursor()
+cursor.execute("DELETE FROM sent_news WHERE pubdate < NOW() - INTERVAL '30 days'")
+deleted_count = cursor.rowcount
+conn.commit()
+logger.info(f"Очищено старых записей: {deleted_count}")
+except Exception as e:
+logger.error(f"Ошибка очистки БД: {e}")
+finally:
+if conn:
+conn.close()
+
+elapsed = time.time() - start_time
+logger.info(f"Проверка завершена за {elapsed:.2f} сек. Новые: {new_count}, дубликаты: {duplicate_count}, не по теме: {irrelevant_count}")
+
+def send_news(title, link):
+try:
+original_title = title
+translated = False
+
+# Пытаемся определить язык
+try:
+detected_lang = translator.detect(title).lang
+if detected_lang != 'ru':
+# Переводим только если язык определен и не русский
+ru_title = translate_text(title, src=detected_lang, dest='ru')
+if ru_title != title:
+title = f"{ru_title}\n({original_title})"
+translated = True
+except Exception as e:
+logger.error(f"Ошибка определения языка: {e}")
+
+# Форматирование сообщения с гиперссылкой вместо полного URL
+message = f"🔬 *{title}*\n\n[Источник]({link})\n\n"
+
+# Добавляем хэштеги в зависимости от языка
+hashtags = "#ВРТ #ЭКО #СуррогатноеМатеринство"
+if translated:
+hashtags += " #Перевод"
+
+message += hashtags
+
+# Отправляем сообщение с поддержкой Markdown
+bot.send_message(
+CHANNEL, 
+message, 
+parse_mode='Markdown',
+disable_web_page_preview=True
+)
+logger.info(f"Отправлена новость: {original_title}")
+except Exception as e:
+logger.error(f'Ошибка отправки: {e}')
+
+# Планировщик с интервалом 5 минут
+scheduler = BackgroundScheduler()
+scheduler.add_job(
+check_feeds,
+'interval',
+minutes=5,
+max_instances=1,
+next_run_time=datetime.now()  # Запустить сразу при старте
+)
+scheduler.start()
+
+# Flask приложение
+app = Flask(__name__)
+
+@app.route('/')
+def home():
+return "Бот активен! Следующая проверка новостей через 5 минут"
+
+@app.route('/check-now')
+def manual_check():
+"""Ручной запуск проверки"""
+try:
+check_feeds()
+return "Проверка новостей запущена!"
+except Exception as e:
+return f"Ошибка: {str(e)}", 500
+
+@app.route('/health')
+def health_check():
+return "OK", 200
+
+if __name__ == '__main__':
+# Запускаем Flask
+port = int(os.environ.get('PORT', 10000))
+logger.info(f"Запуск Flask приложения на порту {port}")
+app.run(host='0.0.0.0', port=port)
